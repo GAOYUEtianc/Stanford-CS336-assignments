@@ -1,1 +1,2 @@
-# Stanford CS336 Assignments
+# Stanford CS336 - Language Modeling from Scratch - Assignments
+Personal learning codes and notes
