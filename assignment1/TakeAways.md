@@ -128,3 +128,35 @@ Byte Pair Encoding (BPE) iteratively merges the most frequent adjacent symbol pa
 - Use a double-ended priority queue or specialized libraries like `sortedcontainers` for faster updates.
 - Implement BPE merges with tries or suffix arrays for large corpora.
 - Consider memory mapping (mmap) for huge input files instead of reading all into RAM.
+
+# Takeaways from Implementing a Tokenizer
+## Goal of the tokenizer
+- Input: raw text string
+- Output: sequence of token IDs (integers)
+- Steps: 
+  - Detect **special tokens** (e.g. `<|endoftext|>`) and preserve them as single units. 
+  - Split the rest of the text into **subword units** (bytes).
+  - Apply **BPE merges** iteratively to combine frequent byte pairs.
+  - Map each final token (as `bytes`) to its corresponding ID from the vocabulary.
+
+## Regex Usage in the Tokenizer
+- Purpose : cleanly split text while keeping special tokens intact.
+- Example construction : 
+    ```
+    pattern = "(" + "|".join(re.escape(st) for st in special_tokens) + ")"
+    _re_specials = re.compile(pattern)
+    ```
+- Why sort special tokens by length:
+    - Without sorting, a shorter token (e.g. `<|endoftext|>`) could match inside a longer one (e.g. `<|endoftext|><|endoftext|>`)
+    - Sorting ensures the longest tokens are matched first, preventing overlaps. 
+- Regex methods:
+    - `re.finditer(pattern, text)`: returns an iterator over **all non-overlapping matches**.
+    - `m.span()`: returns the `(start, end)` indices of a match in the string. 
+    - Use spans to slice the text into tuples of normal parts and special tokens
+    - Use `.findall` to return all substrings that matches the (gpt2) pattern, put in a list by order. (e.g., `_re_gpt2.findall("Hello, world!")` gets `["Hello", ",", " world", "!"]`)
+
+## Iterable, Iterator, and yield
+- Iterable : any object you can loop over (`list`, `str`, `file`, etc).
+- Iterator: produces values one by one.
+- `yield`: turns a function into a generator - it can pause and resume. 
+- In `encode_iterable`, you can process token IDs as they come, rather than waiting for the full encoding. 
