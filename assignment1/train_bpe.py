@@ -5,6 +5,8 @@ from multiprocessing import Pool, cpu_count
 from collections import defaultdict, Counter
 import regex as re
 from functools import partial
+import json
+import html
 
 import heapq
 import cProfile
@@ -12,7 +14,18 @@ import pstats
 from typing import List, Tuple, BinaryIO
 import cProfile, pstats, io
 
+class Tokenizer:
+    def __init__(self, vocab, merges, special_tokens=None):
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens or []
 
+        # NO IGNORECASE
+        self._re_gpt2 = re.compile(
+            r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
+        )
+        
+        
 def find_chunk_boundaries(
     file: BinaryIO,
     desired_num_chunks: int,
@@ -78,203 +91,247 @@ def find_chunk_boundaries(
 #             boundaries.append(boundary)
 #     boundaries.append(len(corpus))
 #     return boundaries
-    
-def pre_tokenize_chunk(chunk: str, special_tokens: list[str]) -> List[Tuple[bytes, int]]:
-    """Pretokenize a chunk, remove special tokens, and return word frequencies"""
-    if not special_tokens:
-        text_bytes = chunk.encode('utf-8')
-        return [(tuple(text_bytes), 1)]
-    
-    # Remove special tokens and split 
-    escaped_tokens = [re.escape(token) for token in special_tokens]
-    pattern = '|'.join(escaped_tokens)
-    
-    segments = re.split(pattern, chunk)
+# global regex (compile once, like GPT-2)
+_re_gpt2 = re.compile(
+    r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
+)
+
+def pre_tokenize_chunk(chunk: str, special_tokens: list[str]) -> list[tuple[bytes, int]]:
+    """
+    Pre-tokenize a text chunk while preserving special tokens and leading spaces.
+    Returns a list of tuples (word_bytes_tuple, frequency).
+    """
     word_freq = Counter()
-    
+
+    # Protect special tokens
+    if special_tokens:
+        escaped_tokens = [re.escape(t) for t in special_tokens]
+        pattern = "(" + "|".join(escaped_tokens) + ")"
+        segments = re.split(pattern, chunk)
+    else:
+        segments = [chunk]
+
     for segment in segments:
-        if segment.strip():# Skip empty segments
-            cleaned_segment = segment.strip()
-            text_bytes = cleaned_segment.encode('utf-8')
-            word_freq[tuple(text_bytes)] += 1
-    
+        if segment == "":
+            continue
+        if special_tokens and segment in special_tokens:
+            word_freq[tuple(segment.encode("utf-8"))] += 1
+        else:
+            # GPT-2 regex preserves spaces in front of words
+            for piece in _re_gpt2.findall(segment):
+                if piece:
+                    word_freq[tuple(piece.encode("utf-8"))] += 1
     return list(word_freq.items())
-    
+
+
+def parallel_pre_tokenize_inmemory(input_path: str, special_tokens: list[str], num_processes: int = 1) -> dict:
+    """
+    Simple in-memory pre-tokenize (single-threaded) suitable for small datasets.
+    This avoids any byte-offset chunking and prevents UTF-8 character boundary errors.
+    Returns a dict mapping tuple(byte_values) -> frequency.
+    """
+    # Read entire file as text (utf-8). Use strict decode to notice problems early,
+    # but you can use errors='replace' if you prefer robustness at expense of exact bytes.
+    with open(input_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    # Delegate to same pre_tokenize_chunk (which splits on special tokens and preserves leading whitespace)
+    items = pre_tokenize_chunk(text, special_tokens)  # returns list of (tuple(byte_values), freq)
+    word_freq = defaultdict(int)
+    for word_tuple, freq in items:
+        word_freq[word_tuple] += freq
+
+    return dict(word_freq)
+
+
+# --- keep this at module level, not inside another function ---
+def _pre_tokenize_wrapper(args):
+    """Helper wrapper to make pre_tokenize_chunk pickleable for multiprocessing."""
+    chunk, special_tokens = args
+    return pre_tokenize_chunk(chunk, special_tokens)
+
 
 def parallel_pre_tokenize(input_path: str, special_tokens: list[str], num_processes: int) -> dict[bytes, int]:
     """Pre-tokenize the corpus into words and get their frequencies in parallel"""
     if num_processes is None:
         num_processes = cpu_count()
-        
-    if not special_tokens:
-        with open(input_path, 'rb') as f:
-            f.seek(0, os.SEEK_END)
-            file_size = f.tell()
-            f.seek(0)
-            
-        chunk_size = max(1, file_size // num_processes)
-        boundaries = list(range(0, file_size + chunk_size, chunk_size))
-        if boundaries[-1] != file_size:
-            boundaries.append(file_size)
-            
-    else:
-        split_special_token = special_tokens[0].encode('utf-8')
-        with open(input_path, 'rb') as f:
-            # Get boundaries based on special tokens
-            boundaries = find_chunk_boundaries(f, num_processes * 2, split_special_token)
-    
+
+    with open(input_path, 'rb') as f:
+        f.seek(0, os.SEEK_END)
+        file_size = f.tell()
+        f.seek(0)
+
+    chunk_size = max(1, file_size // num_processes)
+    boundaries = list(range(0, file_size + chunk_size, chunk_size))
+    if boundaries[-1] != file_size:
+        boundaries.append(file_size)
+
     boudary_length = len(boundaries)
     print(f"Chunk boundaries length: {boudary_length}")
-    # Read each chunk content
+
+    # Read each chunk as text
     chunks = []
     with open(input_path, 'r', encoding='utf-8') as f:
         for i in range(boudary_length - 1):
             start, end = boundaries[i], boundaries[i + 1]
-            # Locate the file pointer to the start of the chunk
             f.seek(start)
-            # read the chunk
             chunk_text = f.read(end - start)
             chunks.append(chunk_text)
-    
-    # Processing each chunk in parallel
-    with Pool(num_processes) as pool:
-        results = pool.map(partial(pre_tokenize_chunk, special_tokens=special_tokens), chunks)
 
-    # Combine the results
+    # Parallel processing (must pass a picklable top-level function)
+    with Pool(num_processes) as pool:
+        results = pool.map(_pre_tokenize_wrapper, [(c, special_tokens) for c in chunks])
+
+    # Combine results
     word_freq = defaultdict(int)
     for chunk_result in results:
         for word_tuple, freq in chunk_result:
             word_freq[word_tuple] += freq
-    
+
     return dict(word_freq)
 
-def train_bpe(input_path: str, 
-              vocab_size: int, 
-              special_tokens: list[str], 
-    ) -> (dict[int, bytes], list[tuple[bytes, bytes]]):
-    """Train a BPE tokenizer on the given input file."""
+
+def train_bpe(
+    input_path: str,
+    vocab_size: int,
+    special_tokens: list[str],
+) -> (dict[int, bytes], list[tuple[bytes, bytes]]):
+    """
+    Train a Byte Pair Encoding (BPE) tokenizer on the given input file.
+
+    Args:
+        input_path: Path to the input corpus file (UTF-8 encoded).
+        vocab_size: Target vocabulary size (including special tokens).
+        special_tokens: List of strings to reserve as special tokens.
+
+    Returns:
+        vocab: A dictionary mapping token IDs to their byte representation.
+        merges: A list of merges performed, each a tuple of (bytes, bytes).
+    """
     if special_tokens is None:
         special_tokens = []
-        
-    # Step 1: Read the input file as bytes
+
+    # Step 1: Read the input file (for reporting corpus size only)
     start_time = time.time()
-    with open(input_path, "r", encoding='utf-8') as f:
+    with open(input_path, "r", encoding="utf-8") as f:
         corpus = f.read()
-        
     print(f"Corpus length: {len(corpus)}, reading time: {time.time() - start_time:.2f} seconds")
-    
-    # Step 2: Pre-tokenization in parallel
+
+    # Step 2: Pre-tokenization (performed in parallel)
     start_time = time.time()
-    word_freq = parallel_pre_tokenize(input_path, special_tokens, num_processes=None)
+    word_freq = parallel_pre_tokenize(input_path, special_tokens, num_processes=4)
     print(f"Pre-tokenization done, unique words: {len(word_freq)}, time: {time.time() - start_time:.2f} seconds")
 
-    # Step 3 : Initialize the vocabulary with single bytes
+    # Step 3: Initialize vocabulary with special tokens and single bytes
     start_time = time.time()
-    special_token_bytes = [token.encode('utf-8') for token in special_tokens]
+    special_token_bytes = [token.encode("utf-8") for token in special_tokens]
     vocab = {
         i: token_bytes
         for i, token_bytes in enumerate(special_token_bytes + [bytes([b]) for b in range(256)])
     }
     token_id = len(vocab)
-        
     print(f"Initial vocabulary size: {len(vocab)}, time: {time.time() - start_time:.2f} seconds")
-    
-    # Step 4 : High efficiency merging
+
+    # Step 4: Initialize word representations and pair frequencies
     print("Starting BPE merging...")
     pr = cProfile.Profile()
     pr.enable()
-    
+
     start_time = time.time()
-    words = {word: list(word) for word in word_freq.keys()}  # Convert each tuple of word to a list of bytes
-    
+    # Represent each word as a list of byte tokens (e.g. "the" -> [b"t", b"h", b"e"])
+    words = {word: [bytes([b]) for b in word] for word in word_freq.keys()}
+
+    # Count frequencies of adjacent pairs of tokens
     pair_freq = Counter()
-    for word_tuple, freq in word_freq.items():
-        if len(word_tuple) > 1:
-            pair_freq.update({
-                (word_tuple[i], word_tuple[i+1]): freq
-                for i in range(len(word_tuple)-1)
-            })
-    
+    for word_tuple in sorted(word_freq.keys()):
+        freq = word_freq[word_tuple]
+        word_bytes = [bytes([b]) for b in word_tuple]
+        if len(word_bytes) > 1:
+            for i in range(len(word_bytes) - 1):
+                pair_freq[(word_bytes[i], word_bytes[i + 1])] += freq
     print(f"Initial pair frequencies calculated, time: {time.time() - start_time:.2f} seconds")
     print(f"Initial unique pairs: {len(pair_freq)}")
-    # Use a max heap to efficiently get the most frequent pair
-    heap = [(-freq, pair) for pair, freq in pair_freq.items()]
-    heapq.heapify(heap)        
+
+    # Use a max heap to efficiently extract the most frequent pair
+    # heap = [(-freq, pair) for pair, freq in pair_freq.items()]
+    # heapq.heapify(heap)
+
     merges = []
-    while len(vocab) < vocab_size and heap:
-        # Pick the highest freq pair from the current heap
-        while heap:
-            neg_freq, best_pair = heapq.heappop(heap)
-            current_freq = -neg_freq
-            # Check if the frequency is accurate or not after previous merges
-            if pair_freq.get(best_pair, 0) == current_freq and current_freq > 0:
-                # the frequency in pair_freq is accurate, if it's not euqal to current_freq,
-                # it means this pair is an outdated entry in the heap, we skip it
-                # Onlyif the frequency is the most up-to-date, we jump out of this while loop
-                # to do the merge
-                break
-        else:
-            break  # If heap is empty, break the outer loop
-        
-        # record the merge, now we want to merge best_pair
+
+    # Step 5: Iteratively perform merges
+    # BPE merge loop with proper tie-breaking
+    while len(vocab) < vocab_size and pair_freq:
+        # Step 1: Find all pairs with max frequency
+        max_freq = max(pair_freq.values())
+        candidates = [pair for pair, freq in pair_freq.items() if freq == max_freq]
+
+        # Step 2: Choose lexicographically greatest pair
+        best_pair = max(candidates)
+
+        # Step 3: Record merge and create new token
         merges.append(best_pair)
-        
-        # Create new token by merging best pair
         new_token = best_pair[0] + best_pair[1]
         vocab[token_id] = new_token
         token_id += 1
-        
-        print(f"Merging pair: {best_pair} with frequency {current_freq}, new vocab size: {len(vocab)+1}")
-        
-        # Update all words and their frequencies
+
+        # Step 4: Update words and pair frequencies
         for word_tuple, freq in word_freq.items():
-            word_repr = words[word_tuple]
-            word_repr_length = len(word_repr)
-            if word_repr_length < 2:
-                continue
-            # Execute the merge
-            i = 0
+            old_repr = words[word_tuple]
             new_repr = []
+            i = 0
             changed = False
-            while i < word_repr_length:
-                if (
-                    i < word_repr_length - 1 and
-                    word_repr[i] == best_pair[0] and
-                    word_repr[i + 1] == best_pair[1]
-                ):
+            while i < len(old_repr):
+                if i < len(old_repr)-1 and old_repr[i] == best_pair[0] and old_repr[i+1] == best_pair[1]:
                     new_repr.append(new_token)
-                    pair_freq[(word_repr[i], word_repr[i+1])] -= freq
                     i += 2
                     changed = True
                 else:
-                    new_repr.append(word_repr[i])
+                    new_repr.append(old_repr[i])
                     i += 1
-                    
+
             if not changed:
-                continue # no merge happened, skip
-                    
+                continue
+
+            # 1) Remove old pairs correctly (handle overlapping)
+            for j in range(len(old_repr)-1):
+                old_pair = (old_repr[j], old_repr[j+1])
+                if old_pair in pair_freq:
+                    pair_freq[old_pair] -= freq
+                    if pair_freq[old_pair] <= 0:
+                        del pair_freq[old_pair]
+
+            # 2) Replace word representation
             words[word_tuple] = new_repr
-            
-            # Add the new pair frequencies
-            new_repr_len = len(new_repr)
-            for i in range(new_repr_len - 1):
-                pair = (new_repr[i], new_repr[i + 1])
-                pair_freq[pair] += freq
-                # Push the updated pair frequency to the heap
-                heapq.heappush(heap, (-pair_freq[pair], pair))
-        
-    print(f"Finished Training! Final vocab size: {len(vocab)}，merge times: {len(merges)}")
+
+            # 3) Add new pairs with overlapping check
+            for j in range(len(new_repr)-1):
+                new_pair = (new_repr[j], new_repr[j+1])
+                pair_freq[new_pair] = pair_freq.get(new_pair, 0) + freq
+
+
+    print(f"Finished Training! Final vocab size: {len(vocab)}, merge times: {len(merges)}")
     pr.disable()
-    pr.dump_stats("step4.prof") 
-    return vocab, merges                
+    pr.dump_stats("step4.prof")
+
+    return vocab, merges
+
         
 if __name__ == "__main__":
     input_path = os.path.join("data", "tinystories_validation.txt")
-    vocab_size = 1000
-    test_chunk = """
-    Once upon a time<|endoftext|>There was a cat<|endoftext|>Once upon a time
-    The dog ran fast<|endoftext|>There was a cat
-    """
-    special_tokens = ["<|endoftext|>", "\n"]
-    train_bpe(input_path, vocab_size, special_tokens)
-
+    vocab_size = 500
+    special_tokens = ["<|endoftext|>"]
+    vocab, merges = train_bpe(input_path, vocab_size, special_tokens)
+    vocab_out = "tinystories_vocab.json"
+    vocab_serializable = {str(k): v.decode("utf-8", errors="replace") for k, v in vocab.items()}
+    with open(vocab_out, "w", encoding="utf-8") as f:
+        json.dump(vocab_serializable, f, ensure_ascii=False, indent=2)
+    print(f"Saved vocab to {vocab_out}")
+    
+    merges_out = "tinystories_merges.txt"
+    with open(merges_out, "w", encoding="utf-8") as f:
+        for a, b in merges:
+            # convert bytes to utf-8 string for writing
+            a_str = a.decode("utf-8", errors="replace")
+            b_str = b.decode("utf-8", errors="replace")
+            f.write(f"{a_str} {b_str}\n")
+    print(f"Saved merges to {merges_out}")
