@@ -1,6 +1,8 @@
 import json
 from typing import Iterable, Iterator, List, Tuple
 import regex as re  # IMPORTANT: use `regex`, not `re`
+import os
+import random
 
 
 class Tokenizer:
@@ -52,13 +54,21 @@ class Tokenizer:
         merges: list[tuple[bytes, bytes]] = []
         with open(merges_filepath, "r", encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
+                line = line.rstrip("\n")
                 if not line or line.startswith("#"):
                     continue
-                a, b = line.split()
-                merges.append((a.encode("utf-8"), b.encode("utf-8")))
-        return cls(vocab, merges, special_tokens=special_tokens)
 
+                # split into exactly two parts, preserving leading spaces
+                parts = line.split(" ", 1)
+                if len(parts) != 2:
+                    raise ValueError(f"Malformed merge line: {line!r}")
+
+                a, b = parts
+                merges.append((a.encode("utf-8"), b.encode("utf-8")))
+
+        return cls(vocab, merges, special_tokens=special_tokens)
+    
+    
     def _bpe_merge(self, tokens: list[bytes]) -> list[bytes]:
         while True:
             if len(tokens) < 2:
@@ -125,3 +135,37 @@ class Tokenizer:
         for chunk in iterable:
             for _id in self.encode(chunk):
                 yield _id
+
+
+def sample_documents(path, n=10, seed=42):
+    """Sample n stories from the file at path."""
+    random.seed(seed)
+    with open(path, "r", encoding="utf-8") as f:
+        docs = [line.strip() for line in f if line.strip()]
+    return random.sample(docs, n)
+
+
+def compute_compression_ratio(tokenizer: Tokenizer, docs: list[str]) -> float:
+    """calculate bytes/token """
+    total_bytes = 0
+    total_tokens = 0
+    for doc in docs:
+        raw_bytes = doc.encode("utf-8")
+        ids = tokenizer.encode(doc)
+        total_bytes += len(raw_bytes)
+        total_tokens += len(ids)
+    return total_bytes / total_tokens if total_tokens > 0 else float("inf")
+
+if __name__ == "__main__":
+    # === Load TinyStories tokenizer ===
+    tinystories_tokenizer = Tokenizer.from_files(
+        vocab_filepath="tinystories_vocab.json",
+        merges_filepath="tinystories_merges.txt",
+        special_tokens=["<|endoftext|>"],
+    )
+    
+    tinystories_docs = sample_documents("data/tinystories_validation.txt", n=10)
+    
+    tinystories_ratio = compute_compression_ratio(tinystories_tokenizer, tinystories_docs)
+    
+    print(f"TinyStories tokenizer compression ratio (bytes/token): {tinystories_ratio:.2f}")

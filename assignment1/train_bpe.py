@@ -317,8 +317,8 @@ def train_bpe(
 
         
 if __name__ == "__main__":
-    input_path = os.path.join("data", "tinystories_validation.txt")
-    vocab_size = 500
+    input_path = os.path.join("data", "tinystories_train.txt")
+    vocab_size = 10000
     special_tokens = ["<|endoftext|>"]
     vocab, merges = train_bpe(input_path, vocab_size, special_tokens)
     vocab_out = "tinystories_vocab.json"
