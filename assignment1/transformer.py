@@ -1,6 +1,8 @@
 import torch.nn as nn
 import torch
 from typing import Optional
+import matplotlib.pyplot as plt
+import numpy as np
 
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
@@ -63,14 +65,14 @@ class RMSNorm(nn.Module):
     
 
 class SwiGLU(nn.Module):
-    def __init__(self, d_model:int, device=None, dtype=None):
+    def __init__(self, d_model:int, d_ff: int = None, device=None, dtype=None):
         super().__init__()
-        
-        # Calculate d_ff to be approsimately 8/3 * d_model
-        d_ff = int(8 * d_model / 3)
-        # Round up to nearrest multiple of 64 for hardware efficiency
-        d_ff = ((d_ff + 63) // 64) * 64
-        
+        if d_ff is None:
+            # Calculate d_ff to be approsimately 8/3 * d_model
+            d_ff = int(8 * d_model / 3)
+            # Round up to nearrest multiple of 64 for hardware efficiency
+            d_ff = ((d_ff + 63) // 64) * 64
+            
         # Three linear transformations
         self.W1 = Linear(d_model, d_ff, device=device, dtype=dtype)
         self.W2 = Linear(d_ff, d_model, device=device, dtype=dtype)
@@ -280,5 +282,489 @@ def scaled_dot_product_attention(
     output = torch.einsum('...nm,...mv->...nv', attention_weights, value) # (..., n, d_v)
     
     return output
+    
+    
+class MultiHeadSelfAttention(nn.Module):
+    """Multi-Head Self-Attention without RoPE (for basic test)"""
+    def __init__(self, 
+        d_model: int,
+        num_heads: int,
+        device=None,
+        dtype=None
+    ):
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.d_v = self.d_k
+        # Linear projections for Q, K, V and output
+        self.W_Q = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.W_K = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.W_V = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.W_O = Linear(d_model, d_model, device=device, dtype=dtype)
+        
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Apply multi-head self-attention (without RoPE).
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, d_model)
+            mask: Optional boolean mask of shape (seq_len, seq_len) where True = attend, False = do not attend
+            
+        Returns:
+            Output tensor of shape (batch_size, seq_len, d_model)
+        """
+            
+        *batch_dims, seq_len, d_model = x.shape
+        batch_size = 1
+        for dim in batch_dims:
+            batch_size *= dim
+            
+        # Reshape gto (batch_size, seq_len, d_model)
+        x_flat = x.view(batch_size, seq_len, d_model)
+        
+        causal_mask = torch.tril(
+            torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device)
+        )
+        if mask is None:
+            mask = causal_mask
+        
+        # Step 1: project to Q, K, V
+        Q = self.W_Q(x_flat) # (batch_size, seq_len, d_model
+        K = self.W_K(x_flat) # (batch_size, seq_len, d_model)
+        V = self.W_V(x_flat) # (batch_size, seq_len, d_model
+        
+        # Step 2: Reshape to separate heads
+        # New shape: (batch_size, num_heads, seq_len, d_k)
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        V = V.view(batch_size, seq_len, self.num_heads, self.d_v).transpose(1, 2)
+        K = K.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        
+        # Step 3 : Apply scaled dot-product attention
+        # Output shape: (batch_size, num_heads, seq_len, d_v)
+        attn_output = scaled_dot_product_attention(Q, K, V, mask)
+        
+        # Step 4 : Concatenate heads
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(batch_size, seq_len, d_model)
+        
+        # Step 5: Final output projection
+        output = self.W_O(attn_output) # (batch_size, seq_len, d_model)
+        output = output.view(*batch_dims, seq_len, d_model)
+        return output
+    
+
+class CausalMultiHeadSelfAttention(nn.Module):
+    """Causal Multi-Head Self-Attention with RoPE"""
+    
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        rope_theta: float = 10000.0,
+        max_seq_len: int = 2048,
+        device=None,
+        dtype=None
+    ):
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.d_v = d_model // num_heads
+        
+        # Linear projections
+        self.W_Q = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.W_K = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.W_V = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.W_O = Linear(d_model, d_model, device=device, dtype=dtype)
+        
+        
+        self.rope = RotaryPositionalEmbedding(
+            theta = rope_theta,
+            d_k=self.d_k,
+            max_seq_len=max_seq_len,
+            device=device
+        )
+        
+        # Register causal mask buffer
+        casual_mask = torch.tril(
+            torch.ones(max_seq_len, max_seq_len, dtype=torch.bool, device=device)
+        )
+        self.register_buffer('casual_mask', casual_mask, persistent=False)
+        
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        token_positions: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Apply causal multi-head self-attention with RoPE.
+        
+        Args:
+            x: Input tensor of shape (..., seq_len, d_model)
+            token_positions: Optional token positions of shape (..., seq_len)
+                           If None, uses [0, 1, 2, ..., seq_len-1]
+            mask: Optional additional mask. If None, uses causal mask.
+        
+        Returns:
+            Output tensor of shape (..., seq_len, d_model)
+        """
+        # print(f"Input x shape : {x.shape}")
+        # print(f"Token positions: {token_positions.shape}")
+        *batch_dims, seq_len, d_model = x.shape
+        batch_size = 1
+        for dim in batch_dims:
+            batch_size *= dim
+            
+        # Reshape to (batch_size, seq_len, d_model)
+        x = x.view(batch_size, seq_len, d_model)
+        
+        # Step 1: Project to Q, K, V
+        Q = self.W_Q(x)
+        K = self.W_K(x)
+        V = self.W_V(x)
+        
+        # Step 2 : Reshape to separate heads of shape (batch_size, num_heads, seq_len, d_k)
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        K = K.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        V = V.view(batch_size, seq_len, self.num_heads, self.d_v).transpose(1, 2)
+        
+        # Step 3 : Apply RoPE to Q and K
+        if token_positions is None:
+            token_positions = torch.arange(seq_len, device=x.device).unsqueeze(0) # shape (1, seq_len)
+                       
+        Q = self.rope(Q, token_positions) # (batch_size, num_heads, seq_len, d_k)
+        K = self.rope(K, token_positions) # (batch_size, num_heads,
+        
+        # Step 4: Get mask
+        if mask is None:
+            # Use casual mask which is a lower triangular matrix
+            mask = self.casual_mask[:seq_len, :seq_len]
+            
+        # Step 5 : Get attention output
+        attn_output = scaled_dot_product_attention(Q, K, V, mask)
+        
+        # Step 6 : Concatenate heads
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(batch_size, seq_len, self.d_model)
+        
+        # Step 7: Apply output projection
+        output = self.W_O(attn_output)
+        output = output.view(*batch_dims, seq_len, self.d_model)
+            
+        return output
+        
+        
+class TransformerBlock(nn.Module):
+    """
+    Pre-norm Transformer block with:
+    1. Multi-head self-attention sublayer
+    2. Feed-forward network sublayer
+    Each sublayer uses: x + Sublayer(RMSNorm(x))
+    """
+    
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float = 10000.0,
+        max_seq_len: int = 2048,
+        device=None,
+        dtype=None
+    ):
+        """
+        Initialize Transformer block.
+        Args:
+            d_model: Dimensionality of model embeddings
+            num_heads: Number of attention heads
+            d_ff: Dimensionality of feed-forward inner layer
+            rope_theta: Theta parameter for RoPE
+            max_seq_len: Maximum sequence length
+            device: Device to create parameters on
+            dtype: Data type for parameters
+        """
+        super().__init__()
+        
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        
+        # Pre-norm for attention sublayer
+        self.attn_norm = RMSNorm(d_model, device=device, dtype=dtype)
+        # Pre-norm for feed-forward sublayer
+        self.ffn_norm = RMSNorm(d_model, device=device, dtype=dtype)
+        
+        # Multi-head self-attention
+        self.attn = CausalMultiHeadSelfAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            rope_theta=rope_theta,
+            max_seq_len=max_seq_len,
+            device=device,
+            dtype=dtype
+        )
+        
+        # Feed-forward network
+        self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+        
+
+    def forward(
+        self, 
+        x: torch.Tensor,
+        token_positions: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Apply Transformer block.
+        
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, d_model)
+            token_positions: Optional token positions of shape (batch_size, seq_len)
+        
+        Returns:
+            Output tensor of shape (batch_size, seq_len, d_model)
+        """
+        # First sublayer: Multi-head self-attention with residual connection
+        # y = x + MultiHeadSelfAttention(RMSNorm(x))
+        attn_input = self.attn_norm(x)
+        attn_output = self.attn(attn_input, token_positions)
+        x = x + attn_output  # Residual connection
+        
+        # Second sublayer: Feed-forward network with residual connection
+        # y = x + FFN(RMSNorm(x))
+        ffn_input = self.ffn_norm(x)
+        ffn_output = self.ffn(ffn_input)
+        x = x + ffn_output  # Residual connection
+        
+        return x
+        
+
+class TransformerLM(nn.Module):
+    """
+    Complete Transformer Language Model.
+    
+    Architecture:
+    1. Token embedding
+    2. Stack of Transformer blocks
+    3. Final RMSNorm
+    4. Output projection to vocabulary
+    """
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float = 10000.0,
+        device=None,
+        dtype=None
+    ):
+        """
+        Initialize Transformer Language Model.
+        
+        Args:
+            vocab_size: Size of the vocabulary
+            context_length: Maximum context length
+            d_model: Dimensionality of model embeddings
+            num_layers: Number of Transformer blocks
+            num_heads: Number of attention heads
+            d_ff: Dimensionality of feed-forward inner layer
+            rope_theta: Theta parameter for RoPE
+            device: Device to create parameters on
+            dtype: Data type for parameters
+        """
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        
+        # Token embedding layer
+        self.token_embedding = Embedding(
+            num_embeddings=vocab_size,
+            embedding_dim=d_model,
+            device=device,
+            dtype=dtype
+        )
+        
+        self.blocks = nn.ModuleList([
+            TransformerBlock(
+                d_model=d_model,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                rope_theta=rope_theta,
+                max_seq_len=context_length,
+                device=device,
+                dtype=dtype
+            ) for _ in range(num_layers)
+        ])
+        
+        # Final layer normalization
+        self.final_norm = RMSNorm(d_model, device=device, dtype=dtype)
+        
+        # Output projection to vocabulary (no bias)
+        self.output_projection = Linear(d_model, vocab_size, device=device, dtype=dtype)
+        
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of Transformer LM.
+        
+        Args:
+            token_ids: Input token IDs of shape (batch_size, seq_len)
+        
+        Returns:
+            Logits over vocabulary of shape (batch_size, seq_len, vocab_size)
+        """
+        batch_size, seq_len = token_ids.shape
+        
+        # Step 1: Token embedding
+        x = self.token_embedding(token_ids)  # (batch_size, seq_len, d_model)
+        
+        # Step 2: Generate token positions for RoPE
+        # Each token at position i in the sequence
+        token_positions = torch.arange(seq_len, device=token_ids.device) # (seq_len,)
+        token_positions = token_positions.unsqueeze(0).expand(batch_size, -1) # (batch_size, seq_len)
+        
+        # Step 3: Pass through Transformer blocks
+        for block in self.blocks:
+            x = block(x, token_positions=token_positions)
+            
+        # Step 4: Final normalization
+        x = self.final_norm(x)  # (batch_size, seq_len, d_model)
+        
+        # Step 5: Output projection to vocabulary
+        logits = self.output_projection(x)  # (batch_size, seq_len, vocab_size
+        return logits
+    
+    
+def count_parameters(model: nn.Module) -> int:
+    """ Count the number of trainable params in transformer"""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def FLOPs(seq_len, d_model, num_heads, d_ff, num_layers):
+    """
+    Rough estimate of FLOPs for a single forward pass of Transformer LM.
+    
+    Args:
+        seq_len: Sequence length
+        d_model: Dimensionality of model embeddings
+        num_heads: Number of attention heads
+        d_ff: Dimensionality of feed-forward inner layer
+        num_layers: Number of Transformer blocks
+    """
+    return seq_len * (
+        4 * vocab_size * d_model + 
+        num_layers * (
+            8 * d_model**2 +
+            4 * d_model * seq_len +
+            6 * d_model * d_ff
+        )
+    )
+
+
+def flops_components(seq_len, d_model, num_heads, d_ff, num_layers):
+    """
+    Return a dict of FLOPs broken down by Transformer LM components.
+    """
+    # Embedding + final logits projection (one-hot matmul implementation)
+    embed_flops = 2 * seq_len * vocab_size * d_model  # embedding
+    final_flops = 2 * seq_len * d_model * vocab_size  # final logits
+
+    # Q, K, V projections per layer
+    qkv_flops = num_layers * (6 * seq_len * d_model * d_model)
+
+    # Attention score and weighted sum (quadratic in seq_len)
+    attn_flops = num_layers * (4 * seq_len**2 * d_model)
+
+    # Output projection after attention
+    wo_flops = num_layers * (2 * seq_len * d_model * d_model)
+
+    # Feed-forward (SwiGLU style)
+    ffn_flops = num_layers * (6 * seq_len * d_model * d_ff)
+
+    return {
+        "Embedding+FinalVocab": embed_flops + final_flops,
+        "QKV": qkv_flops,
+        "Attention (QK, softmax·V)": attn_flops,
+        "WO": wo_flops,
+        "FFN": ffn_flops,
+    }
+
+
+def total_flops(seq_len, d_model, num_heads, d_ff, num_layers):
+    comps = flops_components(seq_len, d_model, num_heads, d_ff, num_layers)
+    return sum(comps.values())
+
+
+def plot_flops_vs_seq(model_cfg, seq_lens):
+    """
+    Plot component-wise FLOPs as a proportion of total FLOPs vs sequence length.
+    model_cfg: dict with d_model, num_heads, d_ff, num_layers, name
+    seq_lens: list/array of sequence lengths
+    """
+    proportions = {key: [] for key in [
+        "Embedding+FinalVocab", "QKV", "Attention (QK, softmax·V)", "WO", "FFN"
+    ]}
+
+    for L in seq_lens:
+        comps = flops_components(L, model_cfg['d_model'], model_cfg['num_heads'], model_cfg['d_ff'], model_cfg['num_layers'])
+        total = sum(comps.values())
+        for k in proportions:
+            proportions[k].append(comps[k] / total)
+
+    # Plot
+    plt.figure(figsize=(8,5))
+    for k, vals in proportions.items():
+        plt.plot(seq_lens, vals, label=k)
+    plt.title(f"FLOPs Proportion vs Sequence Length ({model_cfg['name']})")
+    plt.xlabel("Sequence length")
+    plt.ylabel("Proportion of total FLOPs")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.show()
+
+    
+if __name__ == "__main__":
+    vocab_size = 50257
+    context_length = 1024
+    num_layers = 48
+    d_model = 1600
+    num_heads = 25
+    d_ff = 6400
+    
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=100000.0,
+        device='cpu',
+        dtype=torch.float32
+    )
+    
+    print(f"Total parameters: {count_parameters(model):,}")
+    
+    # In total 2,127,057,600 trainable parameters for GPT2
+    # A FP32 number takes 4 bytes (32 bits), hence 8.5 GB of memory
+    
+    # Example usage: GPT-2 Small config
+    gpt2_small = {"name": "GPT-2 Small", "d_model": 768, "num_heads": 12, "d_ff": 3072, "num_layers": 12}
+    gpt2_medium = {"name": "GPT-2 Medium", "d_model": 1024, "num_heads": 16, "d_ff": 3072, "num_layers": 24}
+    gpt2_large = {"name": "GPT-2 Large", "d_model": 1280, "num_heads": 20, "d_ff": 3072, "num_layers": 36}
+    gpt2_xlarge = {"name": "GPT-2 XL", "d_model": 1600, "num_heads": 25, "d_ff": 6400, "num_layers": 48}
+    
+    seqs = np.arange(128, 4097, 256)
+    plot_flops_vs_seq(gpt2_xlarge, seqs)
+
+    
     
     
