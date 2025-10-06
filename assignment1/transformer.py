@@ -1,8 +1,12 @@
 import torch.nn as nn
 import torch
-from typing import Optional
+from torch.optim.optimizer import Optimizer
+
+from typing import Optional, List, Iterable
 import matplotlib.pyplot as plt
 import numpy as np
+import math
+
 
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
@@ -643,6 +647,109 @@ class TransformerLM(nn.Module):
         return logits
     
     
+class AdamW(Optimizer):
+    """
+    Implements AdamW optimizer.
+    
+    AdamW is Adam with decoupled weight decay as described in:
+    "Decoupled Weight Decay Regularization" - Loshchilov & Hutter (2019)
+    
+    Arguments:
+        params: iterable of parameters to optimize
+        lr: learning rate (default: 1e-3)
+        betas: coefficients for computing running averages (default: (0.9, 0.999))
+        eps: term added to denominator for numerical stability (default: 1e-8)
+        weight_decay: weight decay coefficient (default: 0.01)
+    """ 
+    def __init__(
+        self, 
+        params,
+        lr: float = 1e-3,
+        betas: tuple = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01
+    ):
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if eps < 0:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+        if weight_decay < 0:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super(AdamW, self).__init__(params, defaults)
+        
+    @torch.no_grad()
+    def step(self, closure=None):
+        """
+        Performs a single optimization step.
+        
+        Arguments:
+            closure: A closure that reevaluates the model and returns the loss (optional)
+                     When using LBFGS or other optimizers that require multiple evaluations.
+                     closure is required as it needs to be called within a torch.enable_grad() context.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+                
+        # Iterate through parameter groups
+        for group in self.param_groups:
+            beta1, beta2 = group['betas']
+            lr = group['lr']
+            eps = group['eps']
+            weight_decay = group['weight_decay']
+            
+            # Iterate through parameters
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                
+                grad = p.grad
+                # Get or initialize state for this parameter
+                state = self.state[p] # state is a defaultdict(dict) in Optimizer
+                
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    # First moment vector
+                    state['m'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    # Second moment vector
+                    state['v'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    
+                m = state['m']
+                v = state['v']
+                
+                # Increment step counter
+                state['step'] += 1
+                t = state['step']
+                
+                # Update first moment estimate : m = β1 * m + (1 - β1) * grad
+                m.mul_(beta1).add_(grad, alpha = 1 - beta1)
+                
+                # Update second moment estimate : v = β2 * v + (1 - β2) * (grad ⊙ grad)
+                v.mul_(beta2).addcmul_(grad, grad, value = 1 - beta2)
+                
+                # Compute bias-corrected learning rate
+                bias_correction1 = 1 - beta1 ** t
+                bias_correction2 = 1 - beta2 ** t
+                step_size = lr * (bias_correction2 ** 0.5) / bias_correction1
+                
+                # Update parameters
+                p.addcdiv_(m, v.sqrt().add(eps), value= -step_size)
+                # Apply weight decay, note that this is decoupled from the lr udpate
+                if weight_decay != 0:
+                    p.add_(p, alpha = -lr * weight_decay)
+                    
+        return loss
+                
+
+    
 def count_parameters(model: nn.Module) -> int:
     """ Count the number of trainable params in transformer"""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -729,6 +836,105 @@ def plot_flops_vs_seq(model_cfg, seq_lens):
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.show()
+
+
+def cross_entropy_loss(inputs: torch.Tensor, 
+                       targets: torch.Tensor
+) -> torch.Tensor:
+    """
+    Compute the average cross-entropy loss across a batch.
+
+    Args:
+        inputs (Tensor): Unnormalized logits of shape (batch_size, vocab_size).
+        targets (Tensor): Indices of the correct class (batch_size,).
+
+    Returns:
+        Tensor: Scalar tensor (float), the average cross-entropy loss.
+    """
+    # Step 1 : Shift logits for numerical stability
+    shifted_logits = inputs - inputs.max(dim=-1, keepdim=True).values  # (batch_size, vocab_size)
+    
+    # Step 2 : Compute log-sum-exp
+    log_sum_exp = shifted_logits.exp().sum(dim=-1).log()  # (batch_size,)
+    
+    # Step 3 : Gather the logits corresponding to the target classes
+    target_logits = shifted_logits.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)  # (batch_size,)
+    
+    # Step 4 : Compute per-sample loss: - (logit_correct - logsumexp)
+    losses = -(target_logits - log_sum_exp) # (batch_size,)
+    return losses.mean()  # Average over the batch
+    
+
+def cosine_learning_rate_schedule(
+    it: int,
+    max_learning_rate: float,
+    min_learning_rate: float,
+    warmup_iters: int,
+    cosine_cycle_iters: int
+) -> float:
+    """
+    Compute learning rate at iteration t using cosine annealing with linear warmup.
+    
+    Args:
+        it: Current iteration number (t)
+        max_learning_rate: α_max, maximum learning rate
+        min_learning_rate: α_min, minimum/final learning rate
+        warmup_iters: T_w, number of warmup iterations
+        cosine_cycle_iters: T_c, total iterations for cosine annealing
+    
+    Returns:
+        Learning rate at iteration t
+    """  
+    # Phase 1: Linear warmup
+    if it < warmup_iters:
+        return (it / warmup_iters) * max_learning_rate
+    
+    # Phase 2: Cosine annealing
+    elif it <= cosine_cycle_iters:
+        progress = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
+        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+        return min_learning_rate + cosine_decay * (max_learning_rate - min_learning_rate)
+    
+    # Phase 3: Post-annealing (t > T_c)
+    else:
+        return min_learning_rate
+    
+
+def gradient_clipping(
+    parameters: Iterable[torch.nn.Parameter],
+    max_l2_norm: float,
+    eps: float = 1e-6
+) -> None:
+    """
+    Clip gradients to have L2 norm at most max_l2_norm.
+    
+    If ||g||_2 > max_l2_norm, scale g by max_l2_norm / (||g||_2 + eps)
+    
+    Args:
+        parameters: Iterable of parameters with gradients
+        max_l2_norm: Maximum allowed L2 norm
+        eps: Small value for numerical stability (default: 1e-6)
+    """
+    # Step 1: Collect all gradients and compute total L2 norm
+    # We need to compute the total L2 norm across all parameters
+    total_norm = 0
+    
+    # Convert to list to allow multiple iterations
+    params_with_grad = []
+    for p in parameters:
+        if p.grad is not None:
+            params_with_grad.append(p)
+            # Compute squared norm of this parameter's gradient
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+    # Compute total L2 norm
+    total_norm = total_norm ** 0.5
+    # Compute the clipping coefficient
+    clip_coef = max_l2_norm / (total_norm + eps)
+    # Only clip if total_norm exceeds max_l2_norm
+    if clip_coef < 1:
+        for p in params_with_grad:
+            p.grad.data.mul_(clip_coef)        
 
     
 if __name__ == "__main__":
