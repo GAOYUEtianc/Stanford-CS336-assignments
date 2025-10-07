@@ -48,7 +48,13 @@ class Tokenizer:
         # load vocab (json: {"0": " ", "1": "a", ...})
         with open(vocab_filepath, "r", encoding="utf-8") as f:
             raw_vocab = json.load(f)
-        vocab = {int(k): v.encode("utf-8") for k, v in raw_vocab.items()}
+            
+        vocab = {}
+        token_to_id = {}
+        for token_str, token_id in raw_vocab.items():
+            token_bytes = token_str.encode("utf-8")
+            vocab[token_id] = token_bytes      # id -> bytes
+            token_to_id[token_bytes] = token_id  # bytes -> id
 
         # load merges (text lines "a b"), skip headers / blanks
         merges: list[tuple[bytes, bytes]] = []
@@ -66,7 +72,9 @@ class Tokenizer:
                 a, b = parts
                 merges.append((a.encode("utf-8"), b.encode("utf-8")))
 
-        return cls(vocab, merges, special_tokens=special_tokens)
+        tokenizer = cls(vocab, merges, special_tokens=special_tokens)
+        tokenizer.token_to_id = token_to_id
+        return tokenizer
     
     
     def _bpe_merge(self, tokens: list[bytes]) -> list[bytes]:
@@ -113,18 +121,32 @@ class Tokenizer:
             if not chunk:
                 continue
             if is_spec:
-                st_id = self.token_to_id[chunk.encode("utf-8")]
-                ids.append(st_id)
+                st_bytes = chunk.encode("utf-8")
+                if st_bytes in self.token_to_id:
+                    ids.append(self.token_to_id[st_bytes])
                 continue
 
             # GPT-2-compatible pre-tokenization
             for piece in self._re_gpt2.findall(chunk):
                 if not piece:
                     continue
-                bs = piece.encode("utf-8")
-                byte_tokens = [bytes([b]) for b in bs]
-                merged = self._bpe_merge(byte_tokens)
-                ids.extend(self.token_to_id[tok] for tok in merged)
+                if self.bpe_ranks:
+                    bs = piece.encode("utf-8")
+                    byte_tokens = [bytes([b]) for b in bs]
+                    merged = self._bpe_merge(byte_tokens)
+                    for tok in merged:
+                        if tok in self.token_to_id:
+                            ids.append(self.token_to_id[tok])
+                        else:
+                            for single_byte in tok:
+                                single_byte_token = bytes([single_byte])
+                                if single_byte_token in self.token_to_id:
+                                    ids.append(self.token_to_id[single_byte_token])
+                else:
+                    for char in piece:
+                        char_bytes = char.encode("utf-8")
+                        if char_bytes in self.token_to_id:
+                            ids.append(self.token_to_id[char_bytes])
         return ids
 
     def decode(self, ids: list[int]) -> str:
