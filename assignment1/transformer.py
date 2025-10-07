@@ -2,11 +2,12 @@ import torch.nn as nn
 import torch
 from torch.optim.optimizer import Optimizer
 
-from typing import Optional, List, Iterable
+from typing import Optional, List, Iterable, Tuple, BinaryIO, Union, IO
 import matplotlib.pyplot as plt
 import numpy as np
 import math
-
+import os
+torch._dynamo.config.suppress_errors = True
 
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
@@ -158,59 +159,60 @@ class RotaryPositionalEmbedding(nn.Module):
         self.register_buffer('cos', cos, persistent=False)
         self.register_buffer('sin', sin, persistent=False)
         
-    def forward(self, x: torch.Tensor, token_position: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
         """
         Apply RoPE to input tensor.
         
-        The rotation formula for each pair [x_{2k}, x_{2k+1}] is:
-        [x'_{2k}  ]   [cos(θ)  -sin(θ)] [x_{2k}  ]
-        [x'_{2k+1}] = [sin(θ)   cos(θ)] [x_{2k+1}]
-        
-        Which expands to:
-        x'_{2k}   = x_{2k} * cos(θ) - x_{2k+1} * sin(θ)
-        x'_{2k+1} = x_{2k} * sin(θ) + x_{2k+1} * cos(θ)
-        
         Args:
             x: Input tensor of shape (..., seq_len, d_k)
-            token_positions: Token positions of shape (..., seq_len)
+            token_positions: Token positions of shape (seq_len,) or (..., seq_len)
         
         Returns:
             Rotated tensor of shape (..., seq_len, d_k)
         """
-        # Get cos and sin values for the given positions
-        # token_posisions: (..., seq_len)
-        # cos/sin buffers : (max_seq_len, d_k)
-        
-        # Index into precomputed cos and sin using token_positions
-        cos = self.cos[token_position]  # (..., seq_len, d_k)
-        sin = self.sin[token_position]  # (..., seq_len, d_k)
+        if token_positions.dim() == 1:
+            # Shape: (seq_len,)
+            cos = self.cos[token_positions]  # (seq_len, d_k)
+            sin = self.sin[token_positions]  # (seq_len, d_k)
+            
+            # x shape: (..., seq_len, d_k)
+            # cos/sin shape: (seq_len, d_k)
+            # Need to add dimensions for broadcasting
+            # Add dimensions at the beginning to match x's batch dimensions
+            while cos.dim() < x.dim():
+                cos = cos.unsqueeze(0)
+                sin = sin.unsqueeze(0)
+            
+        elif token_positions.dim() == 2:
+            # Shape: (batch_size, seq_len)
+            cos = self.cos[token_positions]  # (batch_size, seq_len, d_k)
+            sin = self.sin[token_positions]  # (batch_size, seq_len, d_k)
+            
+            # x shape: (batch_size, num_heads, seq_len, d_k)
+            # cos/sin shape: (batch_size, seq_len, d_k)
+            # Need to add num_heads dimension
+            cos = cos.unsqueeze(1)  # (batch_size, 1, seq_len, d_k)
+            sin = sin.unsqueeze(1)  # (batch_size, 1, seq_len, d_k)
+        else:
+            raise ValueError(f"token_positions must be 1D or 2D, got shape {token_positions.shape}")
         
         # Split x into even and odd indices
-        # x: (..., seq_len, d_k)
-        # x_even: (..., seq_len, d_k/2) elements at 0,2,4,...
-        # x_odd:  (..., seq_len, d_k/2) elements at 1,3,5,...
-        x_even = x[..., 0::2] 
-        x_odd = x[..., 1::2]
+        x_even = x[..., 0::2]  # (..., seq_len, d_k/2)
+        x_odd = x[..., 1::2]   # (..., seq_len, d_k/2)
         
-        # Apply rotation 
-        # For the pair [x_{2k}, x_{2k+1}]:
-        # x'_{2k}   = x_{2k} * cos - x_{2k+1} * sin
-        # x'_{2k+1} = x_{2k} * sin + x_{2k+1} * cos
+        # Get cos and sin for even/odd positions
+        cos_even = cos[..., 0::2]
+        cos_odd = cos[..., 1::2]
+        sin_even = sin[..., 0::2]
+        sin_odd = sin[..., 1::2]
         
-        # Get cos and sin for even / odd positions
-        cos_even = cos[..., 0::2] # (..., seq_len, d_k/2)
-        cos_odd = cos[..., 1::2] # (..., seq_len, d_k/2)
-        sin_even = sin[..., 0::2] # (..., seq_len, d_k/2)
-        sin_odd = sin[..., 1::2] # (..., seq_len, d_k/2)
-        
-        # Compute rortated components
+        # Compute rotated values
         x_even_rot = x_even * cos_even - x_odd * sin_even
         x_odd_rot = x_even * sin_odd + x_odd * cos_odd
         
         # Interleave the results back
-        # Stack and reshape to interleave
-        x_out = torch.stack([x_even_rot, x_odd_rot], dim=-1) # (..., seq_len, d_k/2, 2)
-        x_out = x_out.flatten(-2) # (..., seq_len, d_k)
+        x_out = torch.stack([x_even_rot, x_odd_rot], dim=-1)
+        x_out = x_out.flatten(start_dim=-2)
         
         return x_out
                 
@@ -669,6 +671,7 @@ class AdamW(Optimizer):
         eps: float = 1e-8,
         weight_decay: float = 0.01
     ):
+        # super().__init__(params, defaults=dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
         if lr < 0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if eps < 0:
@@ -681,7 +684,9 @@ class AdamW(Optimizer):
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
         
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        # Add capturable=True to disable the problematic compilation
         super(AdamW, self).__init__(params, defaults)
+
         
     @torch.no_grad()
     def step(self, closure=None):
@@ -936,6 +941,95 @@ def gradient_clipping(
         for p in params_with_grad:
             p.grad.data.mul_(clip_coef)        
 
+
+def get_batch(
+    data: np.ndarray,
+    batch_size: int,
+    context_length: int, 
+    device: str = 'mps'
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sample a batch of input sequences and their corresponding targets.
+    
+    Args:
+        data: 1D numpy array of token IDs
+        batch_size: Number of sequences in the batch
+        context_length: Length of each sequence
+        device: Device to place tensors on ('cpu', 'cuda:0', 'mps', etc.)
+    
+    Returns:
+        Tuple of (inputs, targets), each of shape (batch_size, context_length)
+        - inputs: token sequences
+        - targets: next token for each position (shifted by 1)
+    """
+    data_size = len(data)
+    # need to ensure we have enough tokens for context_length + 1 for target
+    # So valid starting indices are in [0, data_size - context_length - 1）
+    max_start_index = data_size - context_length
+    # Randomly sample batch_size starting positions
+    starting_indices = np.random.randint(0, max_start_index, size=batch_size)
+    # Pre-allocate arrays with correct dtype
+    inputs = np.empty((batch_size, context_length), dtype=data.dtype)
+    targets = np.empty((batch_size, context_length), dtype=data.dtype)
+    
+    # Fill in the arrays
+    for i, start_idx in enumerate(starting_indices):
+        inputs[i] = data[start_idx : start_idx + context_length]
+        targets[i] = data[start_idx + 1 : start_idx + context_length + 1]
+        
+    # print(f"inputs is {inputs}")
+    inputs_tensor = torch.from_numpy(inputs.astype(np.int64)).to(device)
+    targets_tensor = torch.from_numpy(targets.astype(np.int64)).to(device)
+    
+    return inputs_tensor, targets_tensor
+
+
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: Union[str, os.PathLike, BinaryIO, IO[bytes]]
+):
+    """ 
+    Save a training checkpoint.
+    
+    Args:
+        model: Model to save
+        optimizer: Optimizer to save
+        iteration: Current training iteration
+        out: Path or file-like object to save to
+    """
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'iteration': iteration
+    }
+    # save checkpoint to a file
+    torch.save(checkpoint, out)
+    
+
+def load_checkpoint(
+    src: Union[str, os.PathLike, BinaryIO, IO[bytes]],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer
+) -> int:
+    """
+    Load a training checkpoint and restore states.
+    
+    Args:
+        src: Path or file-like object to load from
+        model: Model to restore state to
+        optimizer: Optimizer to restore state to
+    
+    Returns:
+        The iteration number from the checkpoint
+    """
+    checkpoint = torch.load(src, map_location='cpu')
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    iteration = checkpoint['iteration']
+    return iteration
+    
     
 if __name__ == "__main__":
     vocab_size = 50257
@@ -970,7 +1064,4 @@ if __name__ == "__main__":
     
     seqs = np.arange(128, 4097, 256)
     plot_flops_vs_seq(gpt2_xlarge, seqs)
-
-    
-    
     
