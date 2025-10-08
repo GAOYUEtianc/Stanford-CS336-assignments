@@ -2,12 +2,10 @@
 .DS_Store
 *.png
 *.json
-*.txt
 *.log
 *.vscode
 __pycache__/
 */tests
-*/data
 *.prof
 *.pt
 *.npy
