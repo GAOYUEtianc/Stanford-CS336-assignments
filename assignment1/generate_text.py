@@ -257,12 +257,12 @@ def load_model_from_checkpoint(
 def main():
     # Configuration (adjust based on your trained model)
     model_config = {
-        'vocab_size': 50257,
-        'context_length': 30,
-        'd_model': 48,  # Adjust based on your model
-        'num_layers': 2,  # Adjust based on your model
-        'num_heads': 12,   # Adjust based on your model
-        'd_ff': 307,     # Adjust based on your model
+        'vocab_size': 10000, # Adjust based on your model
+        'context_length': 256, # Adjust based on your model
+        'd_model': 512,  # Adjust based on your model
+        'num_layers': 4,  # Adjust based on your model
+        'num_heads': 16,   # Adjust based on your model
+        'd_ff': 1344,     # Adjust based on your model
     }
     
     # Device
@@ -271,9 +271,10 @@ def main():
     
     # Load tokenizer
     try:
+        from tokenizer import Tokenizer
         tokenizer = Tokenizer.from_files(
-            vocab_filepath="tests/fixtures/gpt2_vocab.json",
-            merges_filepath="tests/fixtures/gpt2_merges.txt",  # Adjust path if needed
+            vocab_filepath="tinystories_vocab.json",
+            merges_filepath="tinystories_merges.txt",  # Adjust path if needed
             special_tokens=["<|endoftext|>"]
         )
     except:
@@ -287,15 +288,14 @@ def main():
         tokenizer = Tokenizer(vocab=vocab, merges=[], special_tokens=["<|endoftext|>"])
     
     # Load model
-    checkpoint_path = "checkpoints/checkpoint_001950.pt"
+    checkpoint_path = "checkpoints/baseline_small/best_model.pt"  # Adjust path if needed
     generator = load_model_from_checkpoint(checkpoint_path, model_config, tokenizer, device)
     
     # Test prompts
     test_prompts = [
-        "Once",  
-        "Hello",
-        "The cat",        
-        "A"
+        "Once upon a time",
+        "In a galaxy far, far away",
+        "The quick brown fox"
     ]
     
     # Generate with different settings

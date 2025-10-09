@@ -35,12 +35,23 @@ class Embedding(nn.Module):
         )
         nn.init.trunc_normal_(self.weight, mean=0, std=1, a=-3.0, b=3.0)
         
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        # token_ids is of shape (batch_size, seq_len), dtype: long
-        # Output : (batch_size, seq_len, embedding_dim)
-        one_hot = torch.nn.functional.one_hot(token_ids, num_classes = self.weight.shape[0]).to(self.weight.dtype)
-        out = torch.einsum('... n, n d -> ... d', one_hot, self.weight)
-        return out
+    def forward(self, token_ids):
+        vocab_size = self.weight.shape[0]
+
+        # Debug safety check (optional, can remove after stable)
+        if torch.any(token_ids < 0) or torch.any(token_ids >= vocab_size):
+            print("⚠️ Warning: Out-of-range token(s) detected.")
+            print("Min:", token_ids.min().item(), "Max:", token_ids.max().item(), "Vocab size:", vocab_size)
+
+        # Clamp out-of-range tokens into valid range
+        safe_ids = token_ids.clamp(0, vocab_size - 1)
+
+        # Convert to one-hot
+        one_hot = torch.nn.functional.one_hot(safe_ids, num_classes=vocab_size).to(self.weight.dtype)
+
+        # Embedding lookup via matmul
+        return one_hot @ self.weight
+
     
 
 class RMSNorm(nn.Module):
@@ -905,41 +916,17 @@ def cosine_learning_rate_schedule(
         return min_learning_rate
     
 
-def gradient_clipping(
-    parameters: Iterable[torch.nn.Parameter],
-    max_l2_norm: float,
-    eps: float = 1e-6
-) -> None:
-    """
-    Clip gradients to have L2 norm at most max_l2_norm.
+def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, eps: float = 1e-6):
+    params_with_grad = [p for p in parameters if p.grad is not None]
+    if not params_with_grad:
+        return
     
-    If ||g||_2 > max_l2_norm, scale g by max_l2_norm / (||g||_2 + eps)
-    
-    Args:
-        parameters: Iterable of parameters with gradients
-        max_l2_norm: Maximum allowed L2 norm
-        eps: Small value for numerical stability (default: 1e-6)
-    """
-    # Step 1: Collect all gradients and compute total L2 norm
-    # We need to compute the total L2 norm across all parameters
-    total_norm = 0
-    
-    # Convert to list to allow multiple iterations
-    params_with_grad = []
-    for p in parameters:
-        if p.grad is not None:
-            params_with_grad.append(p)
-            # Compute squared norm of this parameter's gradient
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-    # Compute total L2 norm
-    total_norm = total_norm ** 0.5
-    # Compute the clipping coefficient
+    total_norm = torch.norm(torch.stack([p.grad.norm(2) for p in params_with_grad]), 2)
     clip_coef = max_l2_norm / (total_norm + eps)
-    # Only clip if total_norm exceeds max_l2_norm
     if clip_coef < 1:
         for p in params_with_grad:
-            p.grad.data.mul_(clip_coef)        
+            p.grad.mul_(clip_coef)
+       
 
 
 def get_batch(

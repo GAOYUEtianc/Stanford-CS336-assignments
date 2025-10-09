@@ -49,9 +49,16 @@ class Tokenizer:
         with open(vocab_filepath, "r", encoding="utf-8") as f:
             raw_vocab = json.load(f)
             
+        # Print first few items to understand the structure
+        # print("DEBUG: First 5 items in raw_vocab:")
+        for i, (k, v) in enumerate(list(raw_vocab.items())[:5]):
+            print(f"  [{i}] key: {repr(k)} (type: {type(k)}), value: {repr(v)} (type: {type(v)})")
+            
         vocab = {}
         token_to_id = {}
-        for token_str, token_id in raw_vocab.items():
+        for token_id_str, token_str in raw_vocab.items():
+            # print(f"DEBUG: Processing item - key: {repr(token_id_str)}, value: {repr(token_str)}")
+            token_id = int(token_id_str)  # Convert string key to integer
             token_bytes = token_str.encode("utf-8")
             vocab[token_id] = token_bytes      # id -> bytes
             token_to_id[token_bytes] = token_id  # bytes -> id
@@ -73,7 +80,7 @@ class Tokenizer:
                 merges.append((a.encode("utf-8"), b.encode("utf-8")))
 
         tokenizer = cls(vocab, merges, special_tokens=special_tokens)
-        tokenizer.token_to_id = token_to_id
+        # tokenizer.token_to_id = token_to_id
         return tokenizer
     
     

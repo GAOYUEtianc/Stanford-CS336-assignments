@@ -6,6 +6,7 @@ from transformer import *
 import os
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 
 class ExperimentLogger:
@@ -217,9 +218,9 @@ def main():
         
     # Load data with memory mapping
     print("Loading training data...")
-    train_data = np.memmap(args.train_data, dtype=np.uint16, mode='r')
+    train_data = np.load(args.train_data, mmap_mode='r')
     print("Loading validation data...")
-    val_data = np.memmap(args.val_data, dtype=np.uint16, mode='r')
+    val_data = np.load(args.val_data, mmap_mode='r')
     
     print(f"Training tokens: {len(train_data):,}")
     print(f"Validation tokens: {len(val_data):,}")
@@ -337,7 +338,7 @@ def main():
             val_losses = []
             with torch.no_grad():
                 # Evaluate on multiple batches for more stable estimate
-                num_val_batches = min(10, len(val_data) // (args.batch_size * args.context_length))
+                num_val_batches = min(10, max(1, len(val_data) // (args.batch_size * args.context_length)))
                 for _ in range(num_val_batches):
                     val_inputs, val_targets = get_batch(
                         val_data,

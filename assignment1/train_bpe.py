@@ -96,7 +96,7 @@ _re_gpt2 = re.compile(
     r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
 )
 
-def pre_tokenize_chunk(chunk: str, special_tokens: list[str]) -> list[tuple[bytes, int]]:
+def pre_tokenize_chunk(chunk: str, special_tokens: list[str]) -> dict[bytes, int]:
     """
     Pre-tokenize a text chunk while preserving special tokens and leading spaces.
     Returns a list of tuples (word_bytes_tuple, frequency).
@@ -115,13 +115,13 @@ def pre_tokenize_chunk(chunk: str, special_tokens: list[str]) -> list[tuple[byte
         if segment == "":
             continue
         if special_tokens and segment in special_tokens:
-            word_freq[tuple(segment.encode("utf-8"))] += 1
+            word_freq[segment.encode("utf-8")] += 1
         else:
             # GPT-2 regex preserves spaces in front of words
             for piece in _re_gpt2.findall(segment):
                 if piece:
-                    word_freq[tuple(piece.encode("utf-8"))] += 1
-    return list(word_freq.items())
+                    word_freq[piece.encode("utf-8")] += 1 
+    return dict(word_freq)
 
 
 def parallel_pre_tokenize_inmemory(input_path: str, special_tokens: list[str], num_processes: int = 1) -> dict:
@@ -183,10 +183,11 @@ def parallel_pre_tokenize(input_path: str, special_tokens: list[str], num_proces
         results = pool.map(_pre_tokenize_wrapper, [(c, special_tokens) for c in chunks])
 
     # Combine results
-    word_freq = defaultdict(int)
-    for chunk_result in results:
-        for word_tuple, freq in chunk_result:
-            word_freq[word_tuple] += freq
+    # word_freq = defaultdict(int)
+    # for chunk_result in results:
+    #     for word_tuple, freq in chunk_result:
+    #         word_freq[word_tuple] += freq
+    word_freq = parallel_pre_tokenize_inmemory(input_path, special_tokens)
 
     return dict(word_freq)
 
@@ -219,38 +220,54 @@ def train_bpe(
 
     # Step 2: Pre-tokenization (performed in parallel)
     start_time = time.time()
-    word_freq = parallel_pre_tokenize(input_path, special_tokens, num_processes=4)
+    word_freq = pre_tokenize_chunk(corpus, special_tokens)
     print(f"Pre-tokenization done, unique words: {len(word_freq)}, time: {time.time() - start_time:.2f} seconds")
 
-    # Step 3: Initialize vocabulary with special tokens and single bytes
+    # Step 3: Initialize vocabulary with special tokens first, then single bytes
     start_time = time.time()
-    special_token_bytes = [token.encode("utf-8") for token in special_tokens]
-    vocab = {
-        i: token_bytes
-        for i, token_bytes in enumerate(special_token_bytes + [bytes([b]) for b in range(256)])
-    }
-    token_id = len(vocab)
+    vocab = {}
+    token_id = 0
+    
+    # Add special tokens first - these are ATOMIC and won't be split
+    special_token_bytes_set = set()
+    for token in special_tokens:
+        token_bytes = token.encode("utf-8")
+        vocab[token_id] = token_bytes
+        special_token_bytes_set.add(token_bytes)
+        token_id += 1
+    
+    # Add all 256 single byte tokens
+    for b in range(256):
+        vocab[token_id] = bytes([b])
+        token_id += 1
+    
     print(f"Initial vocabulary size: {len(vocab)}, time: {time.time() - start_time:.2f} seconds")
 
-    # Step 4: Initialize word representations and pair frequencies
-    print("Starting BPE merging...")
-    pr = cProfile.Profile()
-    pr.enable()
-
+    # Step 4: Initialize word representations
+    # CRITICAL: Special tokens should NOT be broken down into bytes!
     start_time = time.time()
-    # Represent each word as a list of byte tokens (e.g. "the" -> [b"t", b"h", b"e"])
-    words = {word: [bytes([b]) for b in word] for word in word_freq.keys()}
-
+    words = {}
+    for word_bytes, freq in word_freq.items():
+        if word_bytes in special_token_bytes_set:
+            # Special token: keep as single unit, DO NOT split into bytes
+            words[word_bytes] = [word_bytes]
+        else:
+            # Regular word: split into individual bytes
+            words[word_bytes] = [bytes([b]) for b in word_bytes]
+            
+            
     # Count frequencies of adjacent pairs of tokens
     pair_freq = Counter()
-    for word_tuple in sorted(word_freq.keys()):
-        freq = word_freq[word_tuple]
-        word_bytes = [bytes([b]) for b in word_tuple]
-        if len(word_bytes) > 1:
-            for i in range(len(word_bytes) - 1):
-                pair_freq[(word_bytes[i], word_bytes[i + 1])] += freq
+    for word_bytes in word_freq.keys():
+        freq = word_freq[word_bytes]
+        word_tokens = words[word_bytes]
+        if len(word_tokens) > 1:
+            for i in range(len(word_tokens) - 1):
+                pair_freq[(word_tokens[i], word_tokens[i + 1])] += freq
+    
     print(f"Initial pair frequencies calculated, time: {time.time() - start_time:.2f} seconds")
     print(f"Initial unique pairs: {len(pair_freq)}")
+
 
     # Use a max heap to efficiently extract the most frequent pair
     # heap = [(-freq, pair) for pair, freq in pair_freq.items()]
@@ -276,6 +293,9 @@ def train_bpe(
 
         # Step 4: Update words and pair frequencies
         for word_tuple, freq in word_freq.items():
+            if word_bytes in special_token_bytes_set:
+                continue  # Skip special tokens
+            
             old_repr = words[word_tuple]
             new_repr = []
             i = 0
@@ -309,11 +329,165 @@ def train_bpe(
                 pair_freq[new_pair] = pair_freq.get(new_pair, 0) + freq
 
 
-    print(f"Finished Training! Final vocab size: {len(vocab)}, merge times: {len(merges)}")
-    pr.disable()
-    pr.dump_stats("step4.prof")
+    print(f"Finished Training! Final vocab size: {len(vocab)}, merge count: {len(merges)}")
+    print(f"Merging time: {time.time() - start_time:.2f} seconds")
 
     return vocab, merges
+
+        
+def verify_vocab_and_merges(vocab_path, merges_path, special_tokens=None):
+    """
+    Verify that vocab and merges files are correctly formatted and consistent.
+    """
+    print("=" * 60)
+    print("VERIFICATION SCRIPT FOR BPE VOCAB AND MERGES")
+    print("=" * 60)
+    
+    special_tokens = special_tokens or []
+    
+    # Load vocab
+    print(f"\n1. Loading vocabulary from {vocab_path}...")
+    with open(vocab_path, 'r', encoding='utf-8') as f:
+        vocab_dict = json.load(f)
+    
+    vocab = {int(k): v for k, v in vocab_dict.items()}
+    print(f"   ✓ Vocab size: {len(vocab)}")
+    
+    # Load merges
+    print(f"\n2. Loading merges from {merges_path}...")
+    merges = []
+    with open(merges_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                parts = line.split(' ', 1)
+                if len(parts) == 2:
+                    merges.append((parts[0], parts[1]))
+    print(f"   ✓ Number of merges: {len(merges)}")
+    
+    # Check 1: Vocab should start with special tokens + 256 bytes
+    print("\n3. Checking vocabulary structure...")
+    expected_base_size = len(special_tokens) + 256
+    
+    # Check special tokens are at the beginning
+    for i, token in enumerate(special_tokens):
+        if i not in vocab:
+            print(f"   ✗ Missing special token at index {i}")
+        elif vocab[i] != token:
+            print(f"   ✗ Special token mismatch at {i}: expected '{token}', got '{vocab[i]}'")
+        else:
+            print(f"   ✓ Special token {i}: '{vocab[i]}'")
+    
+    # Check all 256 bytes are present
+    byte_indices = range(len(special_tokens), expected_base_size)
+    missing_bytes = []
+    for idx in byte_indices:
+        if idx not in vocab:
+            missing_bytes.append(idx)
+    
+    if missing_bytes:
+        print(f"   ✗ Missing byte tokens: {missing_bytes[:10]}{'...' if len(missing_bytes) > 10 else ''}")
+    else:
+        print(f"   ✓ All 256 byte tokens present (indices {len(special_tokens)}-{expected_base_size-1})")
+    
+    # Check 2: All merge results should be in vocab
+    print("\n4. Checking merge consistency...")
+    merge_issues = []
+    for i, (a, b) in enumerate(merges):
+        merged = a + b
+        expected_id = expected_base_size + i
+        
+        if expected_id not in vocab:
+            merge_issues.append(f"Merge {i}: token ID {expected_id} not in vocab")
+        elif vocab[expected_id] != merged:
+            merge_issues.append(f"Merge {i}: expected '{merged}', got '{vocab[expected_id]}'")
+    
+    if merge_issues:
+        print(f"   ✗ Found {len(merge_issues)} issues:")
+        for issue in merge_issues[:5]:
+            print(f"      - {issue}")
+        if len(merge_issues) > 5:
+            print(f"      ... and {len(merge_issues) - 5} more")
+    else:
+        print(f"   ✓ All {len(merges)} merges are consistent with vocab")
+    
+    # Check 3: Test encoding example from document
+    print("\n5. Testing example from document...")
+    print("   Example: 'the cat ate'")
+    print("   Expected: [9, 7, 1, 5, 10, 3]")
+    
+    # Manual check if the example vocab matches
+    example_vocab = {
+        0: ' ', 1: 'a', 2: 'c', 3: 'e', 4: 'h', 5: 't',
+        6: 'th', 7: ' c', 8: ' a', 9: 'the', 10: ' at'
+    }
+    
+    # Check 4: Show sample vocab entries
+    print("\n6. Sample vocabulary entries:")
+    sample_indices = [0, 1, 255, 256, 257, len(vocab)-3, len(vocab)-2, len(vocab)-1]
+    for idx in sample_indices:
+        if idx in vocab:
+            token = vocab[idx]
+            display = repr(token) if len(token) <= 20 else repr(token[:20]) + '...'
+            print(f"   vocab[{idx}] = {display}")
+    
+    # Check 5: Show sample merges
+    print("\n7. Sample merges:")
+    sample_merge_indices = [0, 1, 2, len(merges)-3, len(merges)-2, len(merges)-1]
+    for idx in sample_merge_indices:
+        if 0 <= idx < len(merges):
+            a, b = merges[idx]
+            display_a = repr(a) if len(a) <= 15 else repr(a[:15]) + '...'
+            display_b = repr(b) if len(b) <= 15 else repr(b[:15]) + '...'
+            print(f"   merge[{idx}] = ({display_a}, {display_b})")
+    
+    # Check 6: Verify vocab size matches
+    print("\n8. Final checks:")
+    expected_final_size = expected_base_size + len(merges)
+    if len(vocab) == expected_final_size:
+        print(f"   ✓ Vocab size matches: {len(vocab)} = {expected_base_size} (base) + {len(merges)} (merges)")
+    else:
+        print(f"   ✗ Vocab size mismatch: {len(vocab)} != {expected_final_size}")
+    
+    print("\n" + "=" * 60)
+    print("VERIFICATION COMPLETE")
+    print("=" * 60)
+    
+    return vocab, merges
+
+
+def test_encode_decode(vocab, merges, special_tokens):
+    """
+    Test encoding and decoding with a simple example.
+    You'll need to implement the actual Tokenizer class for this.
+    """
+    print("\n" + "=" * 60)
+    print("TESTING ENCODE/DECODE (requires Tokenizer implementation)")
+    print("=" * 60)
+    
+    # Convert vocab back to bytes for Tokenizer
+    vocab_bytes = {k: v.encode('utf-8') for k, v in vocab.items()}
+    merges_bytes = [(a.encode('utf-8'), b.encode('utf-8')) for a, b in merges]
+    
+    # This would require your Tokenizer class to be complete
+    # from your_module import Tokenizer
+    # tokenizer = Tokenizer(vocab_bytes, merges_bytes, special_tokens)
+    
+    # test_strings = [
+    #     "Hello, world!",
+    #     "The cat sat on the mat.",
+    #     "<|endoftext|>",
+    # ]
+    
+    # for text in test_strings:
+    #     ids = tokenizer.encode(text)
+    #     decoded = tokenizer.decode(ids)
+    #     print(f"\nOriginal: {repr(text)}")
+    #     print(f"Encoded:  {ids}")
+    #     print(f"Decoded:  {repr(decoded)}")
+    #     print(f"Match: {text == decoded}")
+    
+    print("\nNote: Implement Tokenizer class to run encode/decode tests")        
 
         
 if __name__ == "__main__":
@@ -335,3 +509,5 @@ if __name__ == "__main__":
             b_str = b.decode("utf-8", errors="replace")
             f.write(f"{a_str} {b_str}\n")
     print(f"Saved merges to {merges_out}")
+    
+    vocab, merges = verify_vocab_and_merges(vocab_out, merges_out, special_tokens)

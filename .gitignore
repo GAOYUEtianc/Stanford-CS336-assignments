@@ -9,3 +9,5 @@ __pycache__/
 *.prof
 *.pt
 *.npy
+data/
+*txt
