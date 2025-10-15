@@ -35,26 +35,30 @@ run_profile() {
     if [ "$mode" == "inference" ]; then
         nsys profile \
             -o "$output_file" \
-            --python-backtrace=cuda \
-            --pytorch \
+            --trace=cuda,nvtx \
+            --force-overwrite=true \
+            --stats=true \
             python profile_with_nsys.py \
                 $model_config \
                 --context_length $context_length \
                 --forward_only \
                 --num_warmup 5 \
                 --num_iterations 10 \
-                --batch_size 8
+                --batch_size 8 \
+                2>&1 | tee "${output_file}.log"
     else
         nsys profile \
             -o "$output_file" \
-            --python-backtrace=cuda \
-            --pytorch \
+            --trace=cuda,nvtx \
+            --force-overwrite=true \
+            --stats=true \
             python profile_with_nsys.py \
                 $model_config \
                 --context_length $context_length \
                 --num_warmup 5 \
                 --num_iterations 10 \
-                --batch_size 8
+                --batch_size 8 \
+                2>&1 | tee "${output_file}.log"
     fi
     
     echo "Results saved to: ${output_file}.nsys-rep"
