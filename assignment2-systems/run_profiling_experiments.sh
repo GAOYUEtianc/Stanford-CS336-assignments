@@ -2,7 +2,7 @@
 
 # Script to run profiling experiments with different configurations
 # Based on Table 1 model sizes and various context lengths
-
+export PYTHONPATH=/workspace/Stanford-CS336-assignments/assignment1:$PYTHONPATH
 # Create output directory for profiling results
 mkdir -p profiling_results
 
