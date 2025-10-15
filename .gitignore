@@ -10,4 +10,5 @@ __pycache__/
 *.pt
 *.npy
 *data/
+*experiments/
 *txt

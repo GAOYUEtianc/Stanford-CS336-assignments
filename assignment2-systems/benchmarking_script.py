@@ -246,7 +246,7 @@ def main():
     tokens_per_step = args.batch_size * args.context_length
     throughput = tokens_per_step / results['mean']
     print(f"Throughput: {throughput:,.0f} tokens/second")
-    print(f"Throughput: {throughput/1000:.2f} tokens/second")
+    print(f"Throughput: {throughput/1000:.2f}K tokens/second")
     
     # Memory usage (if CUDA)
     if device == 'cuda':

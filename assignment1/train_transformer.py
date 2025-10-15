@@ -2,6 +2,8 @@ import argparse
 import time
 import json
 from pathlib import Path
+import sys
+# sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from transformer import *
 import os
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
