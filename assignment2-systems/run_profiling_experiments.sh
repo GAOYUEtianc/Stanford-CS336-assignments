@@ -78,15 +78,15 @@ echo "=== Profiling Small Model (Training) ==="
 run_profile "small" "$MODEL_SMALL" 256 "training"
 
 
-# echo "=== Profiling Medium Model (Inference) ==="
-# for ctx in "${CONTEXT_LENGTHS[@]}"; do
-#     run_profile "medium" "$MODEL_MEDIUM" $ctx "inference"
-# done
+echo "=== Profiling Medium Model (Inference) ==="
+for ctx in "${CONTEXT_LENGTHS[@]}"; do
+    run_profile "medium" "$MODEL_MEDIUM" $ctx "inference"
+done
 
-# echo "=== Profiling Large Model (Inference) ==="
-# for ctx in 128 256; do  # Only shorter contexts to avoid OOM
-#     run_profile "large" "$MODEL_LARGE" $ctx "inference"
-# done
+echo "=== Profiling Large Model (Inference) ==="
+for ctx in 128 256; do  # Only shorter contexts to avoid OOM
+    run_profile "large" "$MODEL_LARGE" $ctx "inference"
+done
 
 echo "=========================================="
 echo "All profiling complete!"
