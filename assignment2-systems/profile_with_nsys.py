@@ -268,7 +268,7 @@ def main():
         cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
     
     # Initialize optimizer
-    optimizer = torch.optim.AdamW(
+    optimizer = AdamW(
         model.parameters(),
         lr=args.learning_rate,
         weight_decay=0.1,
