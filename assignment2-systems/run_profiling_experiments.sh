@@ -71,26 +71,26 @@ echo "Starting profiling experiments..."
 echo "This will generate .nsys-rep files that can be viewed in Nsight Systems"
 echo ""
 
-# Example: Profile small model with different context lengths (inference)
-echo "=== Profiling Small Model (Inference) ==="
-for ctx in "${CONTEXT_LENGTHS[@]}"; do
-    run_profile "small" "$MODEL_SMALL" $ctx "inference"
-done
+# # Example: Profile small model with different context lengths (inference)
+# echo "=== Profiling Small Model (Inference) ==="
+# for ctx in "${CONTEXT_LENGTHS[@]}"; do
+#     run_profile "small" "$MODEL_SMALL" $ctx "inference"
+# done
 
 # Example: Profile small model with context length 256 (full training step)
 echo "=== Profiling Small Model (Training) ==="
 run_profile "small" "$MODEL_SMALL" 256 "training"
 
 
-echo "=== Profiling Medium Model (Inference) ==="
-for ctx in "${CONTEXT_LENGTHS[@]}"; do
-    run_profile "medium" "$MODEL_MEDIUM" $ctx "inference"
-done
+# echo "=== Profiling Medium Model (Inference) ==="
+# for ctx in "${CONTEXT_LENGTHS[@]}"; do
+#     run_profile "medium" "$MODEL_MEDIUM" $ctx "inference"
+# done
 
-echo "=== Profiling Large Model (Inference) ==="
-for ctx in 128 256; do  # Only shorter contexts to avoid OOM
-    run_profile "large" "$MODEL_LARGE" $ctx "inference"
-done
+# echo "=== Profiling Large Model (Inference) ==="
+# for ctx in 128 256; do  # Only shorter contexts to avoid OOM
+#     run_profile "large" "$MODEL_LARGE" $ctx "inference"
+# done
 
 echo "=========================================="
 echo "All profiling complete!"
