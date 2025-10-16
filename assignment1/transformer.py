@@ -8,6 +8,14 @@ import numpy as np
 import math
 import os
 torch._dynamo.config.suppress_errors = True
+# Import NVTX for profiling annotations
+try:
+    import torch.cuda.nvtx as nvtx
+    NVTX_AVAILABLE = True
+except ImportError:
+    NVTX_AVAILABLE = False
+    print("Warning: NVTX not available, profiling annotations will be disabled")
+
 
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
@@ -255,50 +263,94 @@ def softmax(tensor: torch.Tensor, dim: int) -> torch.Tensor:
     
     return softmax_output
 
-def scaled_dot_product_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    mask: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    """ 
-    Compute scaled dot-product attention using einsum.
-    Args : 
-        query: Query tensor of shape (batch_size, ..., seq_len_q, d_k)
-        key: Key tensor of shape (batch_size, ..., seq_len_q, d_k)
-        value: Value tensor of shape (batch_size, ..., seq_len_k, d_v)
-        mask: Optional boolean mask of shape (seq_len_q, seq_len_k) 
-              where True = attend, False = do not attend
-              
-    Returns: 
-        Output tensor of shape (batch_size, ..., seq_len_q, d_v)
+
+def scaled_dot_product_attention(Q, K, V, mask=None):
     """
-    d_k = query.size(-1)
+    Scaled dot-product attention with NVTX annotations for profiling.
     
-    # Step 1 : Compute attention scores using einsum
-    # query : (..., n, d), key: (..., m, d)
-    # We want to compute dot product between each query and key
-    # Output : (..., n, m)
-    scores = torch.einsum('...nd,...md->...nm', query, key)
+    Args:
+        Q: Query tensor [batch_size, num_heads, seq_len, d_k]
+        K: Key tensor [batch_size, num_heads, seq_len, d_k]
+        V: Value tensor [batch_size, num_heads, seq_len, d_k]
+        mask: Optional attention mask
     
-    # Step 2: Scale by 1/sqrt(d_k)
-    scores = scores / (d_k ** 0.5)
+    Returns:
+        Output tensor and attention weights
+    """
+    d_k = Q.size(-1)
     
-    # Step 3: Apply mask if provided
-    if mask is not None:
-        # mask shape: (n, m) or broadcastable to (..., n, m)
-        scores = scores.masked_fill(~mask, float('-inf'))
+    if NVTX_AVAILABLE:
+        with nvtx.range("computing attention scores"):
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / np.sqrt(d_k)
+            
+            # Apply mask if provided
+            # Apply mask if provided
+            if mask is not None:
+                scores = scores.masked_fill(mask == 0, float('-inf'))
+                
+        with nvtx.range("computing softmax"):
+            # Softmax over the last dimension
+            attention_weights = torch.nn.functional.softmax(scores, dim=-1)
+            
+        with nvtx.range("final matmul"):
+            # Weighted sum of values
+            output = torch.matmul(attention_weights, V)
         
-    # Step 4: Apply softmax to get attention weights
-    attention_weights = softmax(scores, dim=-1) # (..., n, m)
-    
-    # Handle the case where an entire row is -inf (no valid keys to attend to)
-    attention_weights = torch.nan_to_num(attention_weights, nan=0.0)
-    
-    # Step 5: Multiply by values
-    output = torch.einsum('...nm,...mv->...nv', attention_weights, value) # (..., n, d_v)
-    
+    else:
+        # Non-annotated version
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / np.sqrt(d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+        attention_weights = torch.nn.functional.softmax(scores, dim=-1)
+        output = torch.matmul(attention_weights, V)
+        
     return output
+
+
+# def scaled_dot_product_attention(
+#     query: torch.Tensor,
+#     key: torch.Tensor,
+#     value: torch.Tensor,
+#     mask: Optional[torch.Tensor] = None
+# ) -> torch.Tensor:
+#     """ 
+#     Compute scaled dot-product attention using einsum.
+#     Args : 
+#         query: Query tensor of shape (batch_size, ..., seq_len_q, d_k)
+#         key: Key tensor of shape (batch_size, ..., seq_len_q, d_k)
+#         value: Value tensor of shape (batch_size, ..., seq_len_k, d_v)
+#         mask: Optional boolean mask of shape (seq_len_q, seq_len_k) 
+#               where True = attend, False = do not attend
+              
+#     Returns: 
+#         Output tensor of shape (batch_size, ..., seq_len_q, d_v)
+#     """
+#     d_k = query.size(-1)
+    
+#     # Step 1 : Compute attention scores using einsum
+#     # query : (..., n, d), key: (..., m, d)
+#     # We want to compute dot product between each query and key
+#     # Output : (..., n, m)
+#     scores = torch.einsum('...nd,...md->...nm', query, key)
+    
+#     # Step 2: Scale by 1/sqrt(d_k)
+#     scores = scores / (d_k ** 0.5)
+    
+#     # Step 3: Apply mask if provided
+#     if mask is not None:
+#         # mask shape: (n, m) or broadcastable to (..., n, m)
+#         scores = scores.masked_fill(~mask, float('-inf'))
+        
+#     # Step 4: Apply softmax to get attention weights
+#     attention_weights = softmax(scores, dim=-1) # (..., n, m)
+    
+#     # Handle the case where an entire row is -inf (no valid keys to attend to)
+#     attention_weights = torch.nan_to_num(attention_weights, nan=0.0)
+    
+#     # Step 5: Multiply by values
+#     output = torch.einsum('...nm,...mv->...nv', attention_weights, value) # (..., n, d_v)
+    
+#     return output
     
     
 class MultiHeadSelfAttention(nn.Module):

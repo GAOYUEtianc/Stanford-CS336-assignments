@@ -261,11 +261,11 @@ def main():
     num_params = count_parameters(model)
     print(f"Model parameters: {num_params:,}")
     
-    # Optionally swap attention implementation with annotated version
-    if not args.no_nvtx and NVTX_AVAILABLE:
-        print("Using annotated scaled_dot_product_attention for detailed profiling")
-        import cs336_basics.model
-        cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
+    # # Optionally swap attention implementation with annotated version
+    # if not args.no_nvtx and NVTX_AVAILABLE:
+    #     print("Using annotated scaled_dot_product_attention for detailed profiling")
+    #     import cs336_basics.model
+    #     cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
     
     # Initialize optimizer
     optimizer = AdamW(
