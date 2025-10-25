@@ -97,15 +97,15 @@ With autocast({autocast_dtype}):
 
 1. Model parameters: FP32 (never automatically cast)
 2. fc1 output (Linear): {autocast_dtype} (MatMul eligible for autocasting)
-3. LayerNorm output: {autocast_dtype} (normalization eligible for autocasting)
+3. LayerNorm output: fp32 (normalization kept in high precision)
 4. Logits: {autocast_dtype} (MatMul eligible for autocasting)
 5. Loss: FP32 (reductions kept in high precision)
 6. Gradients: FP32 (match parameter dtype)
 
 Key Points:
 - Parameters stay in FP32; only operations are cast
-- Linear layers (MatMul)， LayerNorm → cast to {autocast_dtype}
-- reductions, loss → kept in FP32
+- Linear layers (MatMul), → cast to {autocast_dtype}
+- LayerNorm, reductions, loss → kept in FP32
 - Gradients computed in FP32 for stability
 - Backward pass uses same rules as forward pass
 """)

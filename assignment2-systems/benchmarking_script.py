@@ -19,6 +19,7 @@ import argparse
 import timeit
 import numpy as np 
 import torch 
+from contextlib import nullcontext
 
 def benchmark_model(
     model,
@@ -27,7 +28,9 @@ def benchmark_model(
     num_warmup=5,
     num_measurements=10,
     forward_only=False,
-    device='cuda'
+    device='cuda',
+    use_amp=False,
+    amp_dtype=torch.float16
 ):
     """
     Benchmark forward and/or backward passes of a model.
@@ -40,23 +43,41 @@ def benchmark_model(
         num_measurements: Number of measurement iterations
         forward_only: If True, only measure forward pass
         device: Device to run on ('cuda', 'mps', or 'cpu')
+        use_amp: Whether to use automatic mixed precision
+        amp_dtype: Dtype for mixed precision (torch.float16 or torch.bfloat16)
     
     Returns:
         dict: Dictionary containing timing statistics
     """
     model.train()
+    
+    # Create autocast context manager
+    if use_amp and device in ['cuda', 'cpu']:
+        autocast_context = torch.autocast(device_type=device, dtype=amp_dtype)
+        print(f"Using AMP with {amp_dtype}")
+    else:
+        autocast_context = nullcontext()
+        if use_amp:
+            print(f"Warning: AMP not supported on {device}, using full precision")
+        else:
+            print("Using full precision (FP32)")
+            
     # Warmup phase
     print(f"Running {num_warmup} warmup iterations ...")
     for _ in range(num_warmup):
-        logits = model(inputs)
+        with autocast_context:
+            logits = model(inputs)
+            if not forward_only:
+                loss = cross_entropy_loss(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1)
+                )
+        
         if not forward_only:
-            loss = cross_entropy_loss(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1)
-            )
             loss.backward()
             model.zero_grad()
         
+        # Synchronize to ensure GPU completes
         if device == 'cuda':
             torch.cuda.synchronize()
         elif device == 'mps':
@@ -69,19 +90,23 @@ def benchmark_model(
     for i in range(num_measurements):
         start_time = timeit.default_timer()
         
-        # Forward pass
-        logits = model(inputs)
+        # Forward pass with autocast
+        with autocast_context:
+            logits = model(inputs)
+            
+            # Compute loss if doing backward
+            if not forward_only:
+                loss = cross_entropy_loss(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1)
+                )
         
-        # Backward pass (if enabled)
+        # Backward pass (outside autocast)
         if not forward_only:
-            loss = cross_entropy_loss(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1)
-            )
             loss.backward()
             model.zero_grad()
         
-        # Synchronize to ensure GPU complete all operations 
+        # Synchronize to ensure GPU completes all operations
         if device == 'cuda':
             torch.cuda.synchronize()
         elif device == 'mps':
@@ -146,6 +171,12 @@ def main():
                        choices=['float32', 'float16', 'bfloat16'],
                        help='Model dtype')
     
+    parser.add_argument('--use_amp', action='store_true',
+                       help='Use automatic mixed precision training')
+    parser.add_argument('--amp_dtype', type=str, default='bfloat16',
+                       choices=['float16', 'bfloat16'],
+                       help='Dtype for mixed precision (bfloat16 recommended)')
+    
     parser.add_argument('--compile', action='store_true', 
                        help='Use torch.compile for optimization')
     
@@ -173,9 +204,20 @@ def main():
     
     dtype = dtype_map[args.dtype]
     
+    # AMP dtype
+    amp_dtype_map = {
+        'float16': torch.float16,
+        'bfloat16': torch.bfloat16
+    }
+    amp_dtype = amp_dtype_map[args.amp_dtype] if args.use_amp else None
+    
     if args.dtype == 'bfloat16' and device != 'cuda':
         print("Warning: bfloat16 not well supported on CPU/MPS, using float32")
         dtype = torch.float32
+        
+    if args.use_amp and device not in ['cuda', 'cpu']:
+        print("Warning: AMP not fully supported on MPS, disabling")
+        args.use_amp = False
     
     # Print configuration
     print(f"\n{'='*60}")
@@ -185,6 +227,7 @@ def main():
     print(f"Batch size: {args.batch_size}")
     print(f"Context length: {args.context_length}")
     print(f"Dtype: {args.dtype}")
+    print(f"Mixed Precision: {'Enabled (' + args.amp_dtype + ')' if args.use_amp else 'Disabled'}")
     print(f"Warmup steps: {args.num_warmup}")
     print(f"Measurement steps: {args.num_measurements}")
     print(f"Mode: {'Forward only' if args.forward_only else 'Forward + Backward'}")
@@ -235,7 +278,9 @@ def main():
         num_warmup=args.num_warmup,
         num_measurements=args.num_measurements,
         forward_only=args.forward_only,
-        device=device
+        device=device,
+        use_amp=args.use_amp,
+        amp_dtype=amp_dtype
     )
     
     # Print results
