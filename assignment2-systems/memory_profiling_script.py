@@ -24,6 +24,7 @@ from contextlib import nullcontext
 
 def profile_memory(
     model,
+    optimizer,
     inputs,
     targets,
     num_warmup=3,
@@ -38,6 +39,7 @@ def profile_memory(
     
     Args:
         model: The transformer model to profile
+        optimizer: Optimizer (e.g., AdamW)
         inputs: Input tensor [batch_size, context_length]
         targets: Target tensor [batch_size, context_length]
         num_warmup: Number of warmup iterations
@@ -47,8 +49,15 @@ def profile_memory(
         use_amp: Whether to use automatic mixed precision
         amp_dtype: Dtype for mixed precision
     """
-    model.train()
+    
+    if not forward_only:
+        model.train()
+        
     device = next(model.parameters()).device
+    
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
     
     # Create autocast context if needed
     if use_amp:
@@ -63,16 +72,21 @@ def profile_memory(
     print(f"Running {num_warmup} warmup iterations...")
     for i in range(num_warmup):
         with autocast_context:
-            logits = model(inputs)
             if not forward_only:
+                logits = model(inputs)
                 loss = cross_entropy_loss(
                     logits.view(-1, logits.size(-1)),
                     targets.view(-1)
                 )
+            if forward_only:
+                model.eval()
+                with torch.no_grad():
+                    logits = model(inputs)
         
         if not forward_only:
             loss.backward()
-            model.zero_grad()
+            optimizer.step()
+            optimizer.zero_grad()
         
         torch.cuda.synchronize()
         print(f"  Warmup {i+1}/{num_warmup} complete")
@@ -93,18 +107,24 @@ def profile_memory(
             
             # Forward pass
             with autocast_context:
-                logits = model(inputs)
                 
                 if not forward_only:
+                    logits = model(inputs)
                     loss = cross_entropy_loss(
                         logits.view(-1, logits.size(-1)),
                         targets.view(-1)
                     )
+                    
+                if forward_only:
+                    model.eval()
+                    with torch.no_grad():
+                        logits = model(inputs)
             
-            # Backward pass
+            # Backward pass and optimizer step
             if not forward_only:
                 loss.backward()
-                model.zero_grad()
+                optimizer.step()
+                optimizer.zero_grad()
             
             torch.cuda.synchronize()
             
@@ -121,7 +141,7 @@ def profile_memory(
         
         # Stop recording
         torch.cuda.memory._record_memory_history(enabled=None)
-
+    
     # Print final memory statistics
     print("\n" + "="*80)
     print("Memory Profiling Complete")
@@ -145,7 +165,7 @@ def profile_memory(
         'allocated_memory_gb': allocated_memory,
         'reserved_memory_gb': reserved_memory
     }
-    
+
 
 def main():
     parser = argparse.ArgumentParser(description='Memory Profiling for Transformer Models')
@@ -229,6 +249,16 @@ def main():
     print(f"Model size (FP32): {num_params * 4 / 1e9:.3f} GB")
     print(f"Model size (BF16): {num_params * 2 / 1e9:.3f} GB")
     
+    # Initialize optimizer (AdamW)
+    print("\nInitializing AdamW optimizer...")
+    optimizer = AdamW(
+        model.parameters(),
+        lr=1e-3,
+        weight_decay=0.1,
+        betas=(0.9, 0.95)
+    )
+    print("Optimizer initialized (stores momentum and variance for each parameter)")
+    
     # Generate random data
     print("\nGenerating random data...")
     torch.manual_seed(42)
@@ -250,6 +280,7 @@ def main():
     
     results = profile_memory(
         model=model,
+        optimizer=optimizer,
         inputs=inputs,
         targets=targets,
         num_warmup=args.num_warmup,
