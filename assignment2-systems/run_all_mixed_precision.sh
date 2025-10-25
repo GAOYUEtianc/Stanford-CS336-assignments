@@ -19,7 +19,7 @@ python benchmarking_script.py \
     --d_model 768 --num_layers 12 --num_heads 12 --d_ff 3072 \
     --batch_size 8 --context_length 256 \
     --num_warmup 5 --num_measurements 10 \
-    | tee results_small_fp32.txt
+    | tee results_small_fp32_backward.txt
 
 echo ""
 
@@ -39,9 +39,53 @@ python benchmarking_script.py \
     --batch_size 8 --context_length 256 \
     --num_warmup 5 --num_measurements 10 \
     --use_amp --amp_dtype bfloat16 \
-    | tee results_small_bf16.txt
+    | tee results_small_bf16_backward.txt
 
 echo ""
 echo "-----------------------------------"
 echo "Small model complete!"
+echo ""
+
+echo "Testing LARGE model..."
+echo "-----------------------------------"
+
+echo "  a) FP32 baseline..."
+python benchmarking_script.py \
+    --d_model 1280 --num_layers 36 --num_heads 20 --d_ff 5120 \
+    --batch_size 2 --context_length 256 \
+    --forward_only --num_warmup 5 --num_measurements 10 \
+    | tee results_large_fp32.txt
+
+echo ""
+echo "  a) FP32 baseline with backward..."
+python benchmarking_script.py \
+    --d_model 1280 --num_layers 36 --num_heads 20 --d_ff 5120 \
+    --batch_size 2 --context_length 256 \
+    --num_warmup 5 --num_measurements 10 \
+    | tee results_large_fp32_backward.txt
+
+echo ""
+
+echo "  b) BF16 mixed precision..."
+python benchmarking_script.py \
+    --d_model 1280 --num_layers 36 --num_heads 20 --d_ff 5120 \
+    --batch_size 2 --context_length 256 \
+    --forward_only --num_warmup 5 --num_measurements 10 \
+    --use_amp --amp_dtype bfloat16 \
+    | tee results_large_bf16.txt
+
+echo ""
+
+echo "  b) BF16 mixed precision..."
+python benchmarking_script.py \
+    --d_model 1280 --num_layers 36 --num_heads 20 --d_ff 5120 \
+    --batch_size 2 --context_length 256 \
+    --num_warmup 5 --num_measurements 10 \
+    --use_amp --amp_dtype bfloat16 \
+    | tee results_large_bf16_backward.txt
+
+echo ""
+
+echo "-----------------------------------"
+echo "Large model complete!"
 echo ""
