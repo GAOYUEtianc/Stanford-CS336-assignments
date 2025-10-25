@@ -20,7 +20,7 @@ echo "1. Context length 128 - Forward only (FP32)"
 python memory_profiling_script.py \
     $MODEL_2_7B \
     --context_length 128 \
-    --batch_size 4 \
+    --batch_size 32 \
     --forward_only \
     --num_warmup 3 \
     --num_profile_iters 5 \
@@ -32,7 +32,7 @@ echo "2. Context length 128 - Full training step (FP32)"
 python memory_profiling_script.py \
     $MODEL_2_7B \
     --context_length 128 \
-    --batch_size 4 \
+    --batch_size 32 \
     --num_warmup 3 \
     --num_profile_iters 5 \
     --output memory_profiles/2.7b_ctx128_training_fp32.pickle \
@@ -43,7 +43,7 @@ echo "3. Context length 256 - Forward only (FP32)"
 python memory_profiling_script.py \
     $MODEL_2_7B \
     --context_length 256 \
-    --batch_size 4 \
+    --batch_size 32 \
     --forward_only \
     --num_warmup 3 \
     --num_profile_iters 5 \
@@ -55,7 +55,7 @@ echo "4. Context length 256 - Full training step (FP32)"
 python memory_profiling_script.py \
     $MODEL_2_7B \
     --context_length 256 \
-    --batch_size 4 \
+    --batch_size 32 \
     --num_warmup 3 \
     --num_profile_iters 5 \
     --output memory_profiles/2.7b_ctx256_training_fp32.pickle \
@@ -66,7 +66,7 @@ echo "5. Context length 512 - Forward only (FP32)"
 python memory_profiling_script.py \
     $MODEL_2_7B \
     --context_length 512 \
-    --batch_size 2 \
+    --batch_size 32 \
     --forward_only \
     --num_warmup 3 \
     --num_profile_iters 5 \
@@ -78,7 +78,7 @@ echo "6. Context length 512 - Full training step (FP32)"
 python memory_profiling_script.py \
     $MODEL_2_7B \
     --context_length 512 \
-    --batch_size 2 \
+    --batch_size 32 \
     --num_warmup 3 \
     --num_profile_iters 5 \
     --output memory_profiles/2.7b_ctx512_training_fp32.pickle \
@@ -96,7 +96,7 @@ echo "7. Context 256 - Forward only (BF16)"
 python memory_profiling_script.py \
     $MODEL_2_7B \
     --context_length 256 \
-    --batch_size 4 \
+    --batch_size 32 \
     --forward_only \
     --use_amp \
     --amp_dtype bfloat16 \
@@ -110,7 +110,7 @@ echo "8. Context 256 - Full training step (BF16)"
 python memory_profiling_script.py \
     $MODEL_2_7B \
     --context_length 256 \
-    --batch_size 4 \
+    --batch_size 32 \
     --use_amp \
     --amp_dtype bfloat16 \
     --num_warmup 3 \
