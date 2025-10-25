@@ -1,0 +1,7 @@
+## nsys_profile (Small model with context length 256 on A100 as an example)
+- The total forward pass time measured by Nsight Systems is 258.7 ms (25.87 ms/iteration), which matches within 4% of the inference-only measurement of 268.7 ms (26.87 ms/iteration), validating the accuracy of our Python timeit benchmarking with proper CUDA synchronization.
+- The GEMM (matrix multiplication) kernel dominates GPU time during forward pass with approximately 96-144 invocations, and this same kernel family remains dominant during full training with roughly double the invocations (~288 times) due to gradient computations in the backward pass.
+- Beyond matrix multiplications, softmax kernels consume 31.9 ms (12.3% of forward time) and elementwise operations for LayerNorm, GELU, and dropout account for another 10-15%, with softmax being particularly expensive despite low FLOPs due to its memory-bandwidth-bound nature.
+-  The fraction of time spent on matrix multiplication decreases from approximately 75-78% during inference to 59% during full training, as the backward pass and AdamW optimizer introduce substantial elementwise operations (135 ms optimizer step) and memory-intensive gradient computations that grow faster than matmul operations.
+- Attention matmuls (188 ms total) take 5.9× longer than softmax (31.9 ms), despite having ~206× more FLOPs, demonstrating that softmax's memory-bound nature (requiring multiple passes with low arithmetic intensity) makes it disproportionately expensive compared to compute-bound GEMMs that efficiently utilize tensor cores.
+
