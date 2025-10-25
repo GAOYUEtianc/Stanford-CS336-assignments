@@ -89,6 +89,13 @@ def profile_memory(
             optimizer.zero_grad()
         
         torch.cuda.synchronize()
+        
+        if forward_only:
+            del logits  # forward mode need to remove logit
+            
+        torch.cuda.empty_cache()
+        
+        print(f"  Warmup {i+1}/{num_warmup} complete")
         print(f"  Warmup {i+1}/{num_warmup} complete")
     
     # Clear any cached memory before profiling
@@ -105,6 +112,9 @@ def profile_memory(
         for i in range(num_profile_iters):
             print(f"\nProfiling iteration {i+1}/{num_profile_iters}...")
             
+            if i > 0:  
+                torch.cuda.reset_peak_memory_stats()
+                
             # Forward pass
             with autocast_context:
                 
@@ -119,6 +129,7 @@ def profile_memory(
                     model.eval()
                     with torch.no_grad():
                         logits = model(inputs)
+                        torch.cuda.empty_cache()
             
             # Backward pass and optimizer step
             if not forward_only:
@@ -250,14 +261,18 @@ def main():
     print(f"Model size (BF16): {num_params * 2 / 1e9:.3f} GB")
     
     # Initialize optimizer (AdamW)
-    print("\nInitializing AdamW optimizer...")
-    optimizer = AdamW(
-        model.parameters(),
-        lr=1e-3,
-        weight_decay=0.1,
-        betas=(0.9, 0.95)
-    )
-    print("Optimizer initialized (stores momentum and variance for each parameter)")
+    
+    if not args.forward_only:
+        print("\nInitializing AdamW optimizer...")
+        optimizer = AdamW(
+            model.parameters(),
+            lr=1e-3,
+            weight_decay=0.1,
+            betas=(0.9, 0.95)
+        )
+        print("Optimizer initialized (stores momentum and variance for each parameter)")
+    else:
+        optimizer = None
     
     # Generate random data
     print("\nGenerating random data...")
