@@ -440,3 +440,21 @@ BF16 Memory Saving: ~30-35%
 
 Large Model Memory Usage:
 BF16 enables batch_size=32 (FP32 causes OOM)
+
+## Memory Profiling
+The forward pass memory timeline shows the highest peak as PyTorch must retain all intermediate activations for later gradient computation, with memory steadily increasing layer-by-layer through the model. The full training step timeline displays three distinct peaks: the tallest during the forward pass (all activations retained), followed by two lower, roughly equal peaks during the backward pass (gradients + progressively freed activations) and optimizer step (parameter updates using gradients and optimizer momentum/variance states). The forward peak is highest because activations are fully accumulated and not yet freed, while backward and optimizer peaks are similar in height as they both maintain parameters, gradients, and optimizer states but no longer need the full activation memory.
+
+```
+Memory
+  ^
+  |     Forward peak
+  |        /\
+  |       /  \
+  |      /     \  Backward  Optimizer
+  |     /        \ —— —— —— —— —— \
+  |    /                            \
+  |___/____________________________> Time
+       ↑         ↑        ↑
+    Forward  Backward  Optimizer
+```
+AMP saves memory compared with FP32
