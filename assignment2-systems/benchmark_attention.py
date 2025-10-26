@@ -6,7 +6,7 @@ assignment1_dir = os.path.join(os.path.dirname(__file__), '..', 'assignment1')
 sys.path.insert(0, assignment1_dir)
 
 # Now import from transformer
-from transformer import TransformerLM, count_parameters, cross_entropy_loss, AdamW
+from transformer import scaled_dot_product_attention
 
 # Import what we need from train_transformer if available
 try:
@@ -21,36 +21,6 @@ import time
 import numpy as np 
 import torch 
 from itertools import product
-
-def scaled_dot_product_attention(Q, K, V, mask=None):
-    """
-    Standard scaled dot-product attention.
-    
-    Args:
-        Q: Query [batch, seq_len, d_k]
-        K: Key [batch, seq_len, d_k]
-        V: Value [batch, seq_len, d_k]
-        mask: Optional mask
-    
-    Returns:
-        output, attention_weights
-    """
-    d_k = Q.size(-1)
-    
-    # Compute attention scores: Q @ K^T / sqrt(d_k)
-    scores = torch.matmul(Q, K.transpose(-2, -1)) / np.sqrt(d_k)
-    
-    # Apply mask if provided
-    if mask is not None:
-        scores = scores.masked_fill(mask == 0, float('-inf'))
-    
-    # Softmax
-    attention_weights = torch.nn.functional.softmax(scores, dim=-1)
-    
-    # Weighted sum of values
-    output = torch.matmul(attention_weights, V)
-    
-    return output, attention_weights
 
 
 def benchmark_attention(
