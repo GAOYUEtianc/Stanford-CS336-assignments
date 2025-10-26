@@ -39,7 +39,7 @@ def benchmark_attention(
     
     # Warmup
     for _ in range(num_warmup):
-        output, _ = attention_fn(Q, K, V)
+        output = attention_fn(Q, K, V)
         loss = output.sum()
         loss.backward()
         Q.grad = None
@@ -55,7 +55,7 @@ def benchmark_attention(
     start = time.perf_counter()
     
     for _ in range(num_iters):
-        output, _ = attention_fn(Q, K, V)
+        output = attention_fn(Q, K, V)
         torch.cuda.synchronize()
     
     end = time.perf_counter()
@@ -65,7 +65,7 @@ def benchmark_attention(
     memory_before_backward = torch.cuda.memory_allocated() / 1e9
     
     # Benchmark backward pass
-    output, _ = attention_fn(Q, K, V)
+    output = attention_fn(Q, K, V)
     loss = output.sum()
     
     torch.cuda.synchronize()
