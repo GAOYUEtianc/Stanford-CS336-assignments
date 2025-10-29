@@ -458,3 +458,128 @@ Memory
     Forward  Backward  Optimizer
 ```
 AMP saves memory compared with FP32
+
+## Memory scaling with sequence length
+```
+====================================================================================================
+Attention Benchmarking (vanilla PyTorch)
+====================================================================================================
+Batch size: 8
+d_model values: [16, 32, 64, 128]
+Sequence lengths: [256, 1024, 4096, 8192, 16384]
+====================================================================================================
+
+d_model    seq_len    Forward (ms)    Backward (ms)   Mem Before Bwd (GB)  Peak Mem (GB)   Status         
+----------------------------------------------------------------------------------------------------
+16         256        0.258           0.806           0.020                0.026           OK             
+16         1024       0.611           1.423           0.053                0.155           OK             
+16         4096       4.221           10.235          0.562                2.179           OK             
+16         8192       14.186          34.607          2.181                8.636           OK             
+16         16384      56.908          140.362         8.641                34.435          OK             
+32         256        0.334           0.897           0.020                0.027           OK             
+32         1024       0.587           1.435           0.055                0.159           OK             
+32         4096       4.395           10.450          0.571                2.194           OK             
+32         8192       15.077          35.515          2.198                8.666           OK             
+32         16384      60.498          144.024         8.674                34.494          OK             
+64         256        0.345           0.898           0.021                0.029           OK             
+64         1024       0.575           1.426           0.059                0.166           OK             
+64         4096       4.854           10.964          0.587                2.223           OK             
+64         8192       16.891          37.418          2.232                8.724           OK             
+64         16384      67.748          151.426         8.741                34.612          OK             
+128        256        0.344           0.920           0.023                0.033           OK             
+128        1024       0.664           1.502           0.067                0.181           OK             
+128        4096       5.740           11.845          0.621                2.282           OK             
+128        8192       20.332          40.973          2.299                8.842           OK             
+128        16384      81.476          165.394         8.875                34.847          OK             
+====================================================================================================
+
+```
+Memory for backward scales as O(seq_len²) due to attention matrix!
+
+Compare with torch.compile : 
+```
+
+====================================================================================================
+Attention Benchmarking (torch.compile)
+====================================================================================================
+Batch size: 8
+d_model values: [16, 32, 64, 128]
+Sequence lengths: [256, 1024, 4096, 8192, 16384]
+====================================================================================================
+
+Compiling attention with torch.compile()...
+Compilation complete.
+
+d_model    seq_len    Forward (ms)    Backward (ms)   Mem Before Bwd (GB)  Peak Mem (GB)   Status         
+----------------------------------------------------------------------------------------------------
+/workspace/Stanford-CS336-assignments/assignment2-systems/.venv/lib/python3.12/site-packages/torch/_inductor/compile_fx.py:194: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+16         256        0.453           1.162           0.020                0.025           OK             
+16         1024       0.603           1.296           0.053                0.123           OK             
+16         4096       3.662           9.759           0.562                1.649           OK             
+16         8192       13.448          34.864          2.181                6.501           OK             
+16         16384      53.928          131.751         8.641                25.871          OK             
+32         256        0.303           0.861           0.020                0.026           OK             
+32         1024       0.522           1.354           0.055                0.128           OK             
+32         4096       4.481           10.577          0.571                1.670           OK             
+32         8192       15.660          35.994          2.198                6.543           OK             
+32         16384      57.566          135.394         8.674                25.955          OK             
+64         256        0.334           0.662           0.021                0.029           OK             
+64         1024       0.607           1.420           0.059                0.139           OK             
+64         4096       4.945           11.085          0.587                1.712           OK             
+64         8192       17.464          37.859          2.232                6.627           OK             
+64         16384      64.844          142.773         8.741                26.122          OK             
+128        256        0.373           0.961           0.023                0.034           OK             
+128        1024       0.707           1.542           0.067                0.160           OK             
+128        4096       5.819           11.984          0.621                1.795           OK             
+128        8192       20.923          41.536          2.299                6.795           OK             
+128        16384      81.510          165.312         8.875                34.847          OK             
+====================================================================================================
+```
+It can be observed that when seq is long, torch.compile saves memory significantly (around 25%). For very short sequence, the forward time of torch.compile is even slightly worse than vanilla, that is because when sequence is very short, compiling cost might be higher than the benefit of compiling. For backward process, torch.compile saved time. 
+
+## Transformer compilation benchmark
+```
+================================================================================
+Transformer Compilation Benchmark
+================================================================================
+
+Benchmarking VANILLA Transformer
+Config: Large (774M)
+--------------------------------------------------------------------------------
+Parameters: 969,411,840
+
+Benchmarking forward pass...
+Benchmarking full training step...
+
+Benchmarking COMPILED Transformer
+Config: Large (774M)
+--------------------------------------------------------------------------------
+Parameters: 969,411,840
+Compiling model...
+Compilation complete.
+
+Benchmarking forward pass...
+Benchmarking full training step...
+
+================================================================================
+RESULTS COMPARISON
+================================================================================
+
+Metric                         Vanilla (ms)         Compiled (ms)        Speedup        
+--------------------------------------------------------------------------------
+Forward Pass                   318.78               283.66               1.12           x
+Full Training Step             1045.14              922.44               1.13           x
+Backward + Optimizer           723.68               640.30               1.13           x
+================================================================================
+
+ANALYSIS:
+- Forward pass speedup: 1.12x
+- Full training step speedup: 1.13x
+✓ torch.compile provides meaningful speedup!
+
+Reasons for speedup:
+- Kernel fusion (reduces memory traffic)
+- Operator specialization (optimized for specific shapes)
+- Reduced Python overhead
+```

@@ -13,3 +13,4 @@ __pycache__/
 *experiments/
 *txt
 .venv/
+*.pdf
