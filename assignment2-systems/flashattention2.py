@@ -250,4 +250,141 @@ def flash_fwd_kernel(
     tl.store(O_block_ptr, O_final, boundary_check=(0, 1))
     tl.store(L_block_ptr, L, boundary_check=(0,))
 
+
+class FlashAttention2Triton(torch.autograd.Function):
+    """
+    FlashAttention-2 using Triton kernel for forward pass.
+    """
+
+    @staticmethod
+    def forward(ctx, Q, K, V, is_causal=False):
+        """
+        Args:
+            Q: [batch, n_heads, seq_len_q, d_head]
+            K: [batch, n_heads, seq_len_k, d_head]
+            V: [batch, n_heads, seq_len_k, d_head]
+            is_causal: bool
+        
+        Returns:
+            O: [batch, n_heads, seq_len_q, d_head]
+        """
+        # Check inputs
+        assert Q.is_cuda and K.is_cuda and V.is_cuda
+        assert Q.is_contiguous() and K.is_contiguous() and V.is_contiguous()
+        
+        batch, n_heads, seq_len_q, d_head = Q.shape
+        _, _, seq_len_k, _ = K.shape
+        
+        # Flatten batch and heads
+        Q = Q.view(batch * n_heads, seq_len_q, d_head)
+        K = K.view(batch * n_heads, seq_len_k, d_head)
+        V = V.view(batch * n_heads, seq_len_k, d_head)
+        
+        # Tile sizes (tune these!)
+        Q_TILE_SIZE = 64
+        K_TILE_SIZE = 64
+        
+        scale = 1.0 / math.sqrt(d_head)
+        
+        # Allocate output
+        O = torch.empty_like(Q)
+        L = torch.empty(batch * n_heads, seq_len_q, device=Q.device, dtype=torch.float32)
+        
+        # Launch grid: (num_query_tiles, batch * n_heads)
+        grid = (triton.cdiv(seq_len_q, Q_TILE_SIZE), batch * n_heads)
+        
+        flash_fwd_kernel[grid](
+            Q, K, V,
+            O, L,
+            Q.stride(0), Q.stride(1), Q.stride(2),
+            K.stride(0), K.stride(1), K.stride(2),
+            V.stride(0), V.stride(1), V.stride(2),
+            O.stride(0), O.stride(1), O.stride(2),
+            L.stride(0), L.stride(1),
+            seq_len_q, seq_len_k,
+            scale,
+            D=d_head,
+            Q_TILE_SIZE=Q_TILE_SIZE,
+            K_TILE_SIZE=K_TILE_SIZE,
+            is_causal=is_causal,
+        )
+        
+        # Reshape back 
+        O = O.view(batch, n_heads, seq_len_q, d_head)
+        L = L.view(batch, n_heads, seq_len_q)
+        
+        # Save for backward
+        Q = Q.view(batch, n_heads, seq_len_q, d_head)
+        K = K.view(batch, n_heads, seq_len_k, d_head)
+        V = V.view(batch, n_heads, seq_len_k, d_head)
+        
+        ctx.save_for_backward(Q, K, V, O, L)
+        ctx.is_causal = is_causal
+        ctx.scale = scale
+        
+        return O
     
+    
+    @staticmethod
+    def backward(ctx, dO):
+        """
+        Backward pass using recomputation (PyTorch + torch.compile).
+        """
+        Q, K, V, O, L = ctx.saved_tensors
+        is_causal = ctx.is_causal
+        scale = ctx.scale
+        
+        # Use compiled backward function
+        dQ, dK, dV = flash_attention_backward_compiled(
+            Q, K, V, O, dO, L, scale, is_causal
+        )
+        
+        return dQ, dK, dV, None
+
+
+@torch.compile
+def flash_attention_backward_fn(Q, K, V, O, dO, L, scale, is_causal):
+    """
+    FlashAttention-2 backward pass using PyTorch operations.
+    Recomputes forward pass to save memory.
+    """
+    batch, n_heads, seq_len_q, d_head = Q.shape
+    _, _, seq_len_k, _ = K.shape
+    
+    # Pre-compute D = rowsum(O * dO)
+    D = (O * dO).sum(dim=-1, keepdim=True)  # [batch, n_heads, seq_len_q, 1]
+    
+    # Recompute attention scores: S = Q @ K^T / sqrt(d)
+    S = torch.matmul(Q, K.transpose(-2, -1)) * scale
+        
+    # Apply causal mask if needed
+    if is_causal:
+        # Create causal mask
+        q_idx = torch.arange(seq_len_q, device=Q.device)[:, None]
+        k_idx = torch.arange(seq_len_k, device=Q.device)[None, :]
+        mask = q_idx >= k_idx
+        S = S.masked_fill(~mask, float('-inf'))
+        
+    # Recompute attention weights using saved L: P = exp(S - L)
+    P = torch.exp(S - L.unsqueeze(-1))  # [batch, n_heads, seq_len_q, seq_len_k]
+    
+    # Compute gradients
+    # dV = P^T @ dO
+    dV = torch.matmul(P.transpose(-2, -1), dO)
+    
+    # dP = dO @ V^T
+    dP = torch.matmul(dO, V.transpose(-2, -1))
+    
+    # dS = P * (dP - D)
+    dS = P * (dP - D)
+    
+    # dQ = dS @ K / sqrt(d)
+    dQ = torch.matmul(dS, K) * scale
+    
+    # dK = dS^T @ Q / sqrt(d)
+    dK = torch.matmul(dS.transpose(-2, -1), Q) * scale
+    
+    return dQ, dK, dV
+    
+# Compile the backward function
+flash_attention_backward_compiled = torch.compile(flash_attention_backward_fn)
