@@ -70,7 +70,7 @@ class FlashAttention2PyTorch(torch.autograd.Function):
                     # Initialize accumulators for this query tile
                     Oi = torch.zeros(q_end - q_start, d_head, device=Q.device, dtype=torch.float32)
                     li = torch.zeros(q_end - q_start, device=Q.device, dtype=torch.float32)
-                    mi = torch.full((q_end - q_start,), float('-inf'), device=Q.device, dtype=torch.float32)
+                    mi = torch.full((q_end - q_start,), float(-1e6), device=Q.device, dtype=torch.float32)
                     
                     for j in range(Tk):
                         # Key/Value tile bounds
@@ -88,7 +88,7 @@ class FlashAttention2PyTorch(torch.autograd.Function):
                             q_idx = torch.arange(q_start, q_end, device=Q.device)[:, None]
                             k_idx = torch.arange(k_start, k_end, device=Q.device)[None, :]
                             mask = q_idx >= k_idx
-                            Sij = Sij.masked_fill(~mask, float('-inf'))
+                            Sij = Sij.masked_fill(~mask, float(-1e6))
                         
                         # Compute new max: m_new = max(mi, rowmax(Sij))
                         mi_new = torch.maximum(mi, Sij.max(dim=1).values)
@@ -236,7 +236,7 @@ def flash_fwd_kernel(
     # Initialize accumulators (use float32 for precision)
     O_accum = tl.zeros([Q_TILE_SIZE, D], dtype=tl.float32)
     l = tl.zeros([Q_TILE_SIZE], dtype=tl.float32)
-    m = tl.full([Q_TILE_SIZE], value=float('-inf'), dtype=tl.float32)
+    m = tl.full([Q_TILE_SIZE], value=float(-1e6), dtype=tl.float32)
     
     # Query indices for causal masking
     q_offset = query_tile_index * Q_TILE_SIZE
@@ -260,7 +260,7 @@ def flash_fwd_kernel(
             k_indices = k_offset + tl.arange(0, K_TILE_SIZE)
             # Causal mask: q_idx >= k_idx
             causal_mask = q_indices[:, None] >= k_indices[None, :]
-            S = tl.where(causal_mask, S, float('-inf'))
+            S = tl.where(causal_mask, S, float(-1e6))
         
         # Compute new max: m_new = max(m, rowmax(S))
         m_new = tl.maximum(m, tl.max(S, axis=1))
@@ -458,7 +458,7 @@ def flash_attention_backward_fn(Q, K, V, O, dO, L, scale, is_causal):
         q_idx = torch.arange(seq_len_q, device=Q.device)[:, None]
         k_idx = torch.arange(seq_len_k, device=Q.device)[None, :]
         mask = q_idx >= k_idx
-        S = S.masked_fill(~mask, float('-inf'))
+        S = S.masked_fill(~mask, float(-1e6))
     
     # Recompute attention weights using saved L: P = exp(S - L)
     P = torch.exp(S - L.unsqueeze(-1))  # [batch, n_heads, seq_len_q, seq_len_k]
@@ -578,7 +578,7 @@ def benchmark_flashattention():
                         scores = torch.matmul(Q, K.transpose(-2, -1)) * scale
                         # Causal mask
                         mask = torch.tril(torch.ones(seq_len, seq_len, device='cuda')).bool()
-                        scores = scores.masked_fill(~mask, float('-inf'))
+                        scores = scores.masked_fill(~mask, float(-1e6))
                         attn = torch.nn.functional.softmax(scores, dim=-1)
                         out = torch.matmul(attn, V)
                         out.sum().backward()
