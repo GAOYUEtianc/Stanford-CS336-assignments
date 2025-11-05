@@ -155,14 +155,13 @@ def flash_fwd_kernel(
     is_causal: tl.constexpr,
 ):
     """
-    FlashAttention-2 forward kernel in Triton.
-    Each program instance processes one query tile for one batch element.
+    FlashAttention-2 forward kernel using advance() as required
     """
     # Program indices
     query_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)
     
-    # Offset each pointer with the corresponding batch index
+    # Create block pointers
     Q_block_ptr = tl.make_block_ptr(
         Q_ptr + batch_index * stride_qb,
         shape=(N_QUERIES, D),
@@ -176,7 +175,7 @@ def flash_fwd_kernel(
         K_ptr + batch_index * stride_kb,
         shape=(N_KEYS, D),
         strides=(stride_kk, stride_kd),
-        offsets=(0, 0),
+        offsets=(0, 0), 
         block_shape=(K_TILE_SIZE, D),
         order=(1, 0),
     )
@@ -185,7 +184,7 @@ def flash_fwd_kernel(
         V_ptr + batch_index * stride_vb,
         shape=(N_KEYS, D),
         strides=(stride_vk, stride_vd),
-        offsets=(0, 0),
+        offsets=(0, 0),  
         block_shape=(K_TILE_SIZE, D),
         order=(1, 0),
     )
@@ -208,13 +207,13 @@ def flash_fwd_kernel(
         order=(0,),
     )
     
-    # Load Q tile
-    Q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    # Load Q tile 
+    Q = tl.load(Q_block_ptr, boundary_check=(0, 1))
     
-    # Initialize accumulators (use float32 for precision)
+    # Initialize accumulators 
     O_accum = tl.zeros([Q_TILE_SIZE, D], dtype=tl.float32)
     l = tl.zeros([Q_TILE_SIZE], dtype=tl.float32)
-    m = tl.full([Q_TILE_SIZE], value=float('-inf'), dtype=tl.float32)
+    m = tl.full([Q_TILE_SIZE], value=-1e6, dtype=tl.float32) 
     
     # Query indices for causal masking
     q_offset = query_tile_index * Q_TILE_SIZE
@@ -225,57 +224,45 @@ def flash_fwd_kernel(
     
     for k_tile_idx in range(num_k_tiles):
         # Load K, V tiles
-        K_tile = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        V_tile = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        K_tile = tl.load(K_block_ptr, boundary_check=(0, 1))
+        V_tile = tl.load(V_block_ptr, boundary_check=(0, 1))
         
-        # Compute attention scores: S = Q @ K^T * scale
-        S = tl.dot(Q, tl.trans(K_tile))  # [Q_TILE_SIZE, K_TILE_SIZE]
-        S = S * scale
+        # Compute attention scores
+        S = tl.dot(Q, tl.trans(K_tile)) * scale
         
         # Apply causal mask if needed
         if is_causal:
             k_offset = k_tile_idx * K_TILE_SIZE
             k_indices = k_offset + tl.arange(0, K_TILE_SIZE)
-            # Causal mask: q_idx >= k_idx
             causal_mask = q_indices[:, None] >= k_indices[None, :]
-            S = tl.where(causal_mask, S, float('-inf'))
+            S = tl.where(causal_mask, S, -1e6)  
         
-        # Compute new max: m_new = max(m, rowmax(S))
+        # FlashAttention algorithm
         m_new = tl.maximum(m, tl.max(S, axis=1))
-        
-        # Compute unnormalized softmax: P_tilde = exp(S - m_new)
         P_tilde = tl.exp(S - m_new[:, None])
-        
-        # Update running sum: l_new = exp(m - m_new) * l + rowsum(P_tilde)
         l_new = tl.exp(m - m_new) * l + tl.sum(P_tilde, axis=1)
         
-        # Update output accumulator
-        # O_new = diag(exp(m - m_new)) @ O + P_tilde @ V
+        # Update output
         scale_factor = tl.exp(m - m_new)
         O_accum = O_accum * scale_factor[:, None]
-        
-        # Cast P_tilde to V's dtype before matmul
-        P_tilde = P_tilde.to(V_tile.dtype)
-        O_accum += tl.dot(P_tilde, V_tile, acc=O_accum.to(tl.float32))
+        O_accum += tl.dot(P_tilde.to(V_tile.dtype), V_tile)
         
         # Update statistics
         m = m_new
         l = l_new
         
-        # Advance K, V pointers
+        # Advance K, V block pointers
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
     
-    # Final normalization: O = O / l
+    # Final normalization
     O_final = O_accum / l[:, None]
+    L_final = m + tl.log(l)
     
-    # Compute logsumexp: L = m + log(l)
-    L = m + tl.log(l)
-    
-    # Cast output to correct dtype and store
+    # Store results
     O_final = O_final.to(O_block_ptr.type.element_ty)
     tl.store(O_block_ptr, O_final, boundary_check=(0, 1))
-    tl.store(L_block_ptr, L, boundary_check=(0,))
+    tl.store(L_block_ptr, L_final, boundary_check=(0,))
 
 
 class FlashAttention2Triton(torch.autograd.Function):
