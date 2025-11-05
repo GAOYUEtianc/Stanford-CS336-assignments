@@ -155,129 +155,127 @@ def flash_fwd_kernel(
     is_causal: tl.constexpr,
 ):
     """
-    FlashAttention-2 forward kernel using block pointers
+    FlashAttention-2 forward kernel in Triton.
+    Each program instance processes one query tile for one batch element.
     """
-    # Program indices: (query_tile_index, batch_index)
+    # Program indices
     query_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)
     
-    # Calculate the actual number of queries in this tile
-    q_start = query_tile_index * Q_TILE_SIZE
-    q_end = tl.minimum(q_start + Q_TILE_SIZE, N_QUERIES)
-    actual_q_tile_size = q_end - q_start
-    
-    # Create block pointers for Q tile - 修复：使用正确的形状和边界检查
+    # Offset each pointer with the corresponding batch index
     Q_block_ptr = tl.make_block_ptr(
-        base=Q_ptr + batch_index * stride_qb,
+        Q_ptr + batch_index * stride_qb,
         shape=(N_QUERIES, D),
         strides=(stride_qq, stride_qd),
-        offsets=(q_start, 0),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
         block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0)
+        order=(1, 0),
     )
     
-    # Load Q tile with boundary checking
-    Q_tile = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_index * stride_kb,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
     
-    # Initialize accumulators
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_index * stride_vb,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + batch_index * stride_ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(query_tile_index * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+    
+    # Load Q tile
+    Q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    
+    # Initialize accumulators (use float32 for precision)
     O_accum = tl.zeros([Q_TILE_SIZE, D], dtype=tl.float32)
-    l_accum = tl.zeros([Q_TILE_SIZE], dtype=tl.float32)
-    m_accum = tl.full([Q_TILE_SIZE], float('-inf'), dtype=tl.float32)
+    l = tl.zeros([Q_TILE_SIZE], dtype=tl.float32)
+    m = tl.full([Q_TILE_SIZE], value=float('-inf'), dtype=tl.float32)
     
     # Query indices for causal masking
-    q_indices = q_start + tl.arange(0, Q_TILE_SIZE)
+    q_offset = query_tile_index * Q_TILE_SIZE
+    q_indices = q_offset + tl.arange(0, Q_TILE_SIZE)
     
     # Loop over key tiles
     num_k_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
     
     for k_tile_idx in range(num_k_tiles):
-        k_start = k_tile_idx * K_TILE_SIZE
-        k_end = tl.minimum(k_start + K_TILE_SIZE, N_KEYS)
-        actual_k_tile_size = k_end - k_start
-        
-        # Create block pointers for K, V tiles 
-        K_block_ptr = tl.make_block_ptr(
-            base=K_ptr + batch_index * stride_kb,
-            shape=(N_KEYS, D),
-            strides=(stride_kk, stride_kd),
-            offsets=(k_start, 0),
-            block_shape=(K_TILE_SIZE, D),
-            order=(1, 0)
-        )
-        
-        V_block_ptr = tl.make_block_ptr(
-            base=V_ptr + batch_index * stride_vb,
-            shape=(N_KEYS, D),
-            strides=(stride_vk, stride_vd),
-            offsets=(k_start, 0),
-            block_shape=(K_TILE_SIZE, D),
-            order=(1, 0)
-        )
-        
-        # Load K, V tiles with boundary checking
+        # Load K, V tiles
         K_tile = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         V_tile = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
         
         # Compute attention scores: S = Q @ K^T * scale
-        S = tl.dot(Q_tile, tl.trans(K_tile))  # [Q_TILE_SIZE, K_TILE_SIZE]
+        S = tl.dot(Q, tl.trans(K_tile))  # [Q_TILE_SIZE, K_TILE_SIZE]
         S = S * scale
         
         # Apply causal mask if needed
         if is_causal:
-            k_indices = k_start + tl.arange(0, K_TILE_SIZE)
-            # Create causal mask: q_idx >= k_idx
+            k_offset = k_tile_idx * K_TILE_SIZE
+            k_indices = k_offset + tl.arange(0, K_TILE_SIZE)
+            # Causal mask: q_idx >= k_idx
             causal_mask = q_indices[:, None] >= k_indices[None, :]
-            S = tl.where(causal_mask, S, -1e6) 
+            S = tl.where(causal_mask, S, float('-inf'))
         
-        # FlashAttention algorithm
-        # m_new = max(m_accum, rowmax(S))
-        m_new = tl.maximum(m_accum, tl.max(S, axis=1))
+        # Compute new max: m_new = max(m, rowmax(S))
+        m_new = tl.maximum(m, tl.max(S, axis=1))
         
-        # P_tilde = exp(S - m_new)
+        # Compute unnormalized softmax: P_tilde = exp(S - m_new)
         P_tilde = tl.exp(S - m_new[:, None])
         
-        # l_new = exp(m_accum - m_new) * l_accum + rowsum(P_tilde)
-        l_new = tl.exp(m_accum - m_new) * l_accum + tl.sum(P_tilde, axis=1)
+        # Update running sum: l_new = exp(m - m_new) * l + rowsum(P_tilde)
+        l_new = tl.exp(m - m_new) * l + tl.sum(P_tilde, axis=1)
         
-        # Update output: O_accum = diag(exp(m_accum - m_new)) @ O_accum + P_tilde @ V
-        scale_factor = tl.exp(m_accum - m_new)
+        # Update output accumulator
+        # O_new = diag(exp(m - m_new)) @ O + P_tilde @ V
+        scale_factor = tl.exp(m - m_new)
         O_accum = O_accum * scale_factor[:, None]
         
-        # Accumulate with matrix multiplication
-        O_accum += tl.dot(P_tilde.to(V_tile.dtype), V_tile)
+        # Cast P_tilde to V's dtype before matmul
+        P_tilde = P_tilde.to(V_tile.dtype)
+        O_accum += tl.dot(P_tilde, V_tile, acc=O_accum.to(tl.float32))
         
-        # Update running statistics
-        m_accum = m_new
-        l_accum = l_new
+        # Update statistics
+        m = m_new
+        l = l_new
+        
+        # Advance K, V pointers
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
     
-    # Final normalization: O = O_accum / l_accum
-    O_final = O_accum / l_accum[:, None]
+    # Final normalization: O = O / l
+    O_final = O_accum / l[:, None]
     
-    # Compute logsumexp: L = m_accum + log(l_accum)
-    L_final = m_accum + tl.log(l_accum)
+    # Compute logsumexp: L = m + log(l)
+    L = m + tl.log(l)
     
-    # Create block pointers for output 
-    O_block_ptr = tl.make_block_ptr(
-        base=O_ptr + batch_index * stride_ob,
-        shape=(N_QUERIES, D),
-        strides=(stride_oq, stride_od),
-        offsets=(q_start, 0),
-        block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0)
-    )
-    
-    L_block_ptr = tl.make_block_ptr(
-        base=L_ptr + batch_index * stride_lb,
-        shape=(N_QUERIES,),
-        strides=(stride_lq,),
-        offsets=(q_start,),
-        block_shape=(Q_TILE_SIZE,),
-        order=(0,)
-    )
-    
-    # Store results with boundary checking
-    tl.store(O_block_ptr, O_final.to(O_ptr.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(L_block_ptr, L_final, boundary_check=(0,))
+    # Cast output to correct dtype and store
+    O_final = O_final.to(O_block_ptr.type.element_ty)
+    tl.store(O_block_ptr, O_final, boundary_check=(0, 1))
+    tl.store(L_block_ptr, L, boundary_check=(0,))
 
 
 class FlashAttention2Triton(torch.autograd.Function):
