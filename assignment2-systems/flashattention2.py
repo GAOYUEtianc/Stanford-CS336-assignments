@@ -35,15 +35,10 @@ class FlashAttention2PyTorch(torch.autograd.Function):
             O: Same shape as Q
         """
         # Handle both 3D and 4D inputs
-        input_is_3d = Q.dim() == 3
-        if input_is_3d:
-            # Add head dimension: [batch, seq, d] -> [batch, 1, seq, d]
-            Q = Q.unsqueeze(1)
-            K = K.unsqueeze(1)
-            V = V.unsqueeze(1)
+        assert Q.dim() == 3, "Input must be 3D: [batch, seq, dim]"
         
-        batch, n_heads, seq_len_q, d_head = Q.shape
-        _, _, seq_len_k, _ = K.shape
+        batch, seq_len_q, d_head = Q.shape
+        _, seq_len_k, _ = K.shape
         
         # Tile sizes
         Q_TILE_SIZE = 64  # Bq
@@ -53,78 +48,71 @@ class FlashAttention2PyTorch(torch.autograd.Function):
         
         # Initialize output and logsumexp
         O = torch.zeros_like(Q)
-        L = torch.zeros(batch, n_heads, seq_len_q, device=Q.device, dtype=torch.float32)
+        L = torch.zeros(batch, seq_len_q, device=Q.device, dtype=torch.float32)
         
         # Split Q into tiles
         Tq = math.ceil(seq_len_q / Q_TILE_SIZE)
         Tk = math.ceil(seq_len_k / K_TILE_SIZE)
         
         for b in range(batch):
-            for h in range(n_heads):
-                for i in range(Tq):
-                    # Query tile bounds
-                    q_start = i * Q_TILE_SIZE
-                    q_end = min((i + 1) * Q_TILE_SIZE, seq_len_q)
-                    Qi = Q[b, h, q_start:q_end, :]  # [Bq, d]
+            for i in range(Tq):
+                # Query tile bounds
+                q_start = i * Q_TILE_SIZE
+                q_end = min((i + 1) * Q_TILE_SIZE, seq_len_q)
+                Qi = Q[b, q_start:q_end, :]  # [Bq, d]
+                
+                # Initialize accumulators for this query tile
+                Oi = torch.zeros(q_end - q_start, d_head, device=Q.device, dtype=torch.float32)
+                li = torch.zeros(q_end - q_start, device=Q.device, dtype=torch.float32)
+                mi = torch.full((q_end - q_start,), float(-1e6), device=Q.device, dtype=torch.float32)
+                
+                for j in range(Tk):
+                    # Key/Value tile bounds
+                    k_start = j * K_TILE_SIZE
+                    k_end = min((j + 1) * K_TILE_SIZE, seq_len_k)
+                    Kj = K[b, k_start:k_end, :]  # [Bk, d]
+                    Vj = V[b, k_start:k_end, :]  # [Bk, d]
                     
-                    # Initialize accumulators for this query tile
-                    Oi = torch.zeros(q_end - q_start, d_head, device=Q.device, dtype=torch.float32)
-                    li = torch.zeros(q_end - q_start, device=Q.device, dtype=torch.float32)
-                    mi = torch.full((q_end - q_start,), float(-1e6), device=Q.device, dtype=torch.float32)
+                    # Compute attention scores: Sij = Qi @ Kj^T / sqrt(d)
+                    Sij = torch.matmul(Qi, Kj.t()) * scale  # [Bq, Bk]
                     
-                    for j in range(Tk):
-                        # Key/Value tile bounds
-                        k_start = j * K_TILE_SIZE
-                        k_end = min((j + 1) * K_TILE_SIZE, seq_len_k)
-                        Kj = K[b, h, k_start:k_end, :]  # [Bk, d]
-                        Vj = V[b, h, k_start:k_end, :]  # [Bk, d]
-                        
-                        # Compute attention scores: Sij = Qi @ Kj^T / sqrt(d)
-                        Sij = torch.matmul(Qi, Kj.t()) * scale  # [Bq, Bk]
-                        
-                        # Apply causal mask if needed
-                        if is_causal:
-                            # Create causal mask
-                            q_idx = torch.arange(q_start, q_end, device=Q.device)[:, None]
-                            k_idx = torch.arange(k_start, k_end, device=Q.device)[None, :]
-                            mask = q_idx >= k_idx
-                            Sij = Sij.masked_fill(~mask, float(-1e6))
-                        
-                        # Compute new max: m_new = max(mi, rowmax(Sij))
-                        mi_new = torch.maximum(mi, Sij.max(dim=1).values)
-                        
-                        # Compute unnormalized softmax: P_tilde = exp(Sij - m_new)
-                        P_tilde = torch.exp(Sij - mi_new[:, None])
-                        
-                        # Update running sum: li_new = exp(mi - mi_new) * li + rowsum(P_tilde)
-                        li_new = torch.exp(mi - mi_new) * li + P_tilde.sum(dim=1)
-                        
-                        # Update output: Oi = diag(exp(mi - mi_new)) @ Oi + P_tilde @ Vj
-                        Oi = torch.exp(mi - mi_new)[:, None] * Oi + torch.matmul(P_tilde, Vj)
-                        
-                        # Update running statistics
-                        mi = mi_new
-                        li = li_new
+                    # Apply causal mask if needed
+                    if is_causal:
+                        # Create causal mask
+                        q_idx = torch.arange(q_start, q_end, device=Q.device)[:, None]
+                        k_idx = torch.arange(k_start, k_end, device=Q.device)[None, :]
+                        mask = q_idx >= k_idx
+                        Sij = Sij.masked_fill(~mask, float(-1e6))
                     
-                    # Final normalization: Oi = Oi / li
-                    Oi = Oi / li[:, None]
+                    # Compute new max: m_new = max(mi, rowmax(Sij))
+                    mi_new = torch.maximum(mi, Sij.max(dim=1).values)
                     
-                    # Compute logsumexp: Li = mi + log(li)
-                    Li = mi + torch.log(li)
+                    # Compute unnormalized softmax: P_tilde = exp(Sij - m_new)
+                    P_tilde = torch.exp(Sij - mi_new[:, None])
                     
-                    # Write to output
-                    O[b, h, q_start:q_end, :] = Oi
-                    L[b, h, q_start:q_end] = Li
-        
-        # Remove head dimension if input was 3D
-        if input_is_3d:
-            O = O.squeeze(1)
-            L = L.squeeze(1)
+                    # Update running sum: li_new = exp(mi - mi_new) * li + rowsum(P_tilde)
+                    li_new = torch.exp(mi - mi_new) * li + P_tilde.sum(dim=1)
+                    
+                    # Update output: Oi = diag(exp(mi - mi_new)) @ Oi + P_tilde @ Vj
+                    Oi = torch.exp(mi - mi_new)[:, None] * Oi + torch.matmul(P_tilde, Vj)
+                    
+                    # Update running statistics
+                    mi = mi_new
+                    li = li_new
+                
+                # Final normalization: Oi = Oi / li
+                Oi = Oi / li[:, None]
+                
+                # Compute logsumexp: Li = mi + log(li)
+                Li = mi + torch.log(li)
+                
+                # Write to output
+                O[b, q_start:q_end, :] = Oi
+                L[b, q_start:q_end] = Li
         
         # Save for backward
         ctx.save_for_backward(Q, K, V, O, L)
         ctx.is_causal = is_causal
-        ctx.input_is_3d = input_is_3d
         
         return O
     
@@ -133,11 +121,7 @@ class FlashAttention2PyTorch(torch.autograd.Function):
         """Backward pass using recomputation."""
         Q, K, V, O, L = ctx.saved_tensors
         is_causal = ctx.is_causal
-        input_is_3d = ctx.input_is_3d
         
-        # Add head dimension if needed
-        if input_is_3d:
-            dO = dO.unsqueeze(1)
         
         d_head = Q.shape[-1]
         scale = 1.0 / math.sqrt(d_head)
@@ -146,12 +130,6 @@ class FlashAttention2PyTorch(torch.autograd.Function):
         dQ, dK, dV = flash_attention_backward_compiled(
             Q, K, V, O, dO, L, scale, is_causal
         )
-        
-        # Remove head dimension if input was 3D
-        if input_is_3d:
-            dQ = dQ.squeeze(1)
-            dK = dK.squeeze(1)
-            dV = dV.squeeze(1)
         
         return dQ, dK, dV, None
 
@@ -177,127 +155,129 @@ def flash_fwd_kernel(
     is_causal: tl.constexpr,
 ):
     """
-    FlashAttention-2 forward kernel in Triton.
-    Each program instance processes one query tile for one batch element.
+    FlashAttention-2 forward kernel using block pointers
     """
-    # Program indices
+    # Program indices: (query_tile_index, batch_index)
     query_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)
     
-    # Offset each pointer with the corresponding batch index
+    # Calculate the actual number of queries in this tile
+    q_start = query_tile_index * Q_TILE_SIZE
+    q_end = tl.minimum(q_start + Q_TILE_SIZE, N_QUERIES)
+    actual_q_tile_size = q_end - q_start
+    
+    # Create block pointers for Q tile - 修复：使用正确的形状和边界检查
     Q_block_ptr = tl.make_block_ptr(
-        Q_ptr + batch_index * stride_qb,
+        base=Q_ptr + batch_index * stride_qb,
         shape=(N_QUERIES, D),
         strides=(stride_qq, stride_qd),
-        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        offsets=(q_start, 0),
         block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
+        order=(1, 0)
     )
     
-    K_block_ptr = tl.make_block_ptr(
-        K_ptr + batch_index * stride_kb,
-        shape=(N_KEYS, D),
-        strides=(stride_kk, stride_kd),
-        offsets=(0, 0),
-        block_shape=(K_TILE_SIZE, D),
-        order=(1, 0),
-    )
+    # Load Q tile with boundary checking
+    Q_tile = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
     
-    V_block_ptr = tl.make_block_ptr(
-        V_ptr + batch_index * stride_vb,
-        shape=(N_KEYS, D),
-        strides=(stride_vk, stride_vd),
-        offsets=(0, 0),
-        block_shape=(K_TILE_SIZE, D),
-        order=(1, 0),
-    )
-    
-    O_block_ptr = tl.make_block_ptr(
-        O_ptr + batch_index * stride_ob,
-        shape=(N_QUERIES, D),
-        strides=(stride_oq, stride_od),
-        offsets=(query_tile_index * Q_TILE_SIZE, 0),
-        block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
-    )
-    
-    L_block_ptr = tl.make_block_ptr(
-        L_ptr + batch_index * stride_lb,
-        shape=(N_QUERIES,),
-        strides=(stride_lq,),
-        offsets=(query_tile_index * Q_TILE_SIZE,),
-        block_shape=(Q_TILE_SIZE,),
-        order=(0,),
-    )
-    
-    # Load Q tile
-    Q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
-    
-    # Initialize accumulators (use float32 for precision)
+    # Initialize accumulators
     O_accum = tl.zeros([Q_TILE_SIZE, D], dtype=tl.float32)
-    l = tl.zeros([Q_TILE_SIZE], dtype=tl.float32)
-    m = tl.full([Q_TILE_SIZE], value=float(-1e6), dtype=tl.float32)
+    l_accum = tl.zeros([Q_TILE_SIZE], dtype=tl.float32)
+    m_accum = tl.full([Q_TILE_SIZE], float('-inf'), dtype=tl.float32)
     
     # Query indices for causal masking
-    q_offset = query_tile_index * Q_TILE_SIZE
-    q_indices = q_offset + tl.arange(0, Q_TILE_SIZE)
+    q_indices = q_start + tl.arange(0, Q_TILE_SIZE)
     
     # Loop over key tiles
     num_k_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
     
     for k_tile_idx in range(num_k_tiles):
-        # Load K, V tiles
+        k_start = k_tile_idx * K_TILE_SIZE
+        k_end = tl.minimum(k_start + K_TILE_SIZE, N_KEYS)
+        actual_k_tile_size = k_end - k_start
+        
+        # Create block pointers for K, V tiles 
+        K_block_ptr = tl.make_block_ptr(
+            base=K_ptr + batch_index * stride_kb,
+            shape=(N_KEYS, D),
+            strides=(stride_kk, stride_kd),
+            offsets=(k_start, 0),
+            block_shape=(K_TILE_SIZE, D),
+            order=(1, 0)
+        )
+        
+        V_block_ptr = tl.make_block_ptr(
+            base=V_ptr + batch_index * stride_vb,
+            shape=(N_KEYS, D),
+            strides=(stride_vk, stride_vd),
+            offsets=(k_start, 0),
+            block_shape=(K_TILE_SIZE, D),
+            order=(1, 0)
+        )
+        
+        # Load K, V tiles with boundary checking
         K_tile = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         V_tile = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
         
         # Compute attention scores: S = Q @ K^T * scale
-        S = tl.dot(Q, tl.trans(K_tile))  # [Q_TILE_SIZE, K_TILE_SIZE]
+        S = tl.dot(Q_tile, tl.trans(K_tile))  # [Q_TILE_SIZE, K_TILE_SIZE]
         S = S * scale
         
         # Apply causal mask if needed
         if is_causal:
-            k_offset = k_tile_idx * K_TILE_SIZE
-            k_indices = k_offset + tl.arange(0, K_TILE_SIZE)
-            # Causal mask: q_idx >= k_idx
+            k_indices = k_start + tl.arange(0, K_TILE_SIZE)
+            # Create causal mask: q_idx >= k_idx
             causal_mask = q_indices[:, None] >= k_indices[None, :]
-            S = tl.where(causal_mask, S, float(-1e6))
+            S = tl.where(causal_mask, S, -1e6) 
         
-        # Compute new max: m_new = max(m, rowmax(S))
-        m_new = tl.maximum(m, tl.max(S, axis=1))
+        # FlashAttention algorithm
+        # m_new = max(m_accum, rowmax(S))
+        m_new = tl.maximum(m_accum, tl.max(S, axis=1))
         
-        # Compute unnormalized softmax: P_tilde = exp(S - m_new)
+        # P_tilde = exp(S - m_new)
         P_tilde = tl.exp(S - m_new[:, None])
         
-        # Update running sum: l_new = exp(m - m_new) * l + rowsum(P_tilde)
-        l_new = tl.exp(m - m_new) * l + tl.sum(P_tilde, axis=1)
+        # l_new = exp(m_accum - m_new) * l_accum + rowsum(P_tilde)
+        l_new = tl.exp(m_accum - m_new) * l_accum + tl.sum(P_tilde, axis=1)
         
-        # Update output accumulator
-        # O_new = diag(exp(m - m_new)) @ O + P_tilde @ V
-        scale_factor = tl.exp(m - m_new)
+        # Update output: O_accum = diag(exp(m_accum - m_new)) @ O_accum + P_tilde @ V
+        scale_factor = tl.exp(m_accum - m_new)
         O_accum = O_accum * scale_factor[:, None]
         
-        # Cast P_tilde to V's dtype before matmul
-        P_tilde = P_tilde.to(V_tile.dtype)
-        O_accum += tl.dot(P_tilde, V_tile, acc=O_accum.to(tl.float32))
+        # Accumulate with matrix multiplication
+        O_accum += tl.dot(P_tilde.to(V_tile.dtype), V_tile)
         
-        # Update statistics
-        m = m_new
-        l = l_new
-        
-        # Advance K, V pointers
-        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
-        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+        # Update running statistics
+        m_accum = m_new
+        l_accum = l_new
     
-    # Final normalization: O = O / l
-    O_final = O_accum / l[:, None]
+    # Final normalization: O = O_accum / l_accum
+    O_final = O_accum / l_accum[:, None]
     
-    # Compute logsumexp: L = m + log(l)
-    L = m + tl.log(l)
+    # Compute logsumexp: L = m_accum + log(l_accum)
+    L_final = m_accum + tl.log(l_accum)
     
-    # Cast output to correct dtype and store
-    O_final = O_final.to(O_block_ptr.type.element_ty)
-    tl.store(O_block_ptr, O_final, boundary_check=(0, 1))
-    tl.store(L_block_ptr, L, boundary_check=(0,))
+    # Create block pointers for output 
+    O_block_ptr = tl.make_block_ptr(
+        base=O_ptr + batch_index * stride_ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(q_start, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0)
+    )
+    
+    L_block_ptr = tl.make_block_ptr(
+        base=L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(q_start,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,)
+    )
+    
+    # Store results with boundary checking
+    tl.store(O_block_ptr, O_final.to(O_ptr.dtype.element_ty), boundary_check=(0, 1), padding_option="zero")
+    tl.store(L_block_ptr, L_final, boundary_check=(0,), padding_option="zero")
 
 
 class FlashAttention2Triton(torch.autograd.Function):
@@ -309,9 +289,9 @@ class FlashAttention2Triton(torch.autograd.Function):
     def forward(ctx, Q, K, V, is_causal=False):
         """
         Args:
-            Q: [batch, seq_len_q, d_head] or [batch, n_heads, seq_len_q, d_head]
-            K: [batch, seq_len_k, d_head] or [batch, n_heads, seq_len_k, d_head]
-            V: [batch, seq_len_k, d_head] or [batch, n_heads, seq_len_k, d_head]
+            Q: [batch, seq_len_q, d_head]
+            K: [batch, seq_len_k, d_head] 
+            V: [batch, seq_len_k, d_head]
             is_causal: bool
         
         Returns:
@@ -323,18 +303,11 @@ class FlashAttention2Triton(torch.autograd.Function):
         
         # Handle both 3D and 4D inputs
         input_is_3d = Q.dim() == 3
-        if input_is_3d:
-            Q = Q.unsqueeze(1)
-            K = K.unsqueeze(1)
-            V = V.unsqueeze(1)
+        assert input_is_3d, "Input must be 3D: [batch, seq, dim]"
         
-        batch, n_heads, seq_len_q, d_head = Q.shape
-        _, _, seq_len_k, _ = K.shape
-        
-        # Flatten batch and heads
-        Q = Q.view(batch * n_heads, seq_len_q, d_head)
-        K = K.view(batch * n_heads, seq_len_k, d_head)
-        V = V.view(batch * n_heads, seq_len_k, d_head)
+        batch, seq_len_q, d_head = Q.shape
+        _, seq_len_k, _ = K.shape
+    
         
         # Tile sizes (tune these!)
         Q_TILE_SIZE = 64
@@ -344,10 +317,10 @@ class FlashAttention2Triton(torch.autograd.Function):
         
         # Allocate output
         O = torch.empty_like(Q)
-        L = torch.empty(batch * n_heads, seq_len_q, device=Q.device, dtype=torch.float32)
+        L = torch.empty(batch, seq_len_q, device=Q.device, dtype=torch.float32)
         
-        # Launch grid: (num_query_tiles, batch * n_heads)
-        grid = (triton.cdiv(seq_len_q, Q_TILE_SIZE), batch * n_heads)
+        # Launch grid: (num_query_tiles, batch)
+        grid = (triton.cdiv(seq_len_q, Q_TILE_SIZE), batch)
         
         flash_fwd_kernel[grid](
             Q, K, V,
@@ -365,30 +338,10 @@ class FlashAttention2Triton(torch.autograd.Function):
             is_causal=is_causal,
         )
         
-        # Reshape back
-        O = O.view(batch, n_heads, seq_len_q, d_head)
-        L = L.view(batch, n_heads, seq_len_q)
-        
-        # Remove head dimension if input was 3D
-        if input_is_3d:
-            O = O.squeeze(1)
-            L = L.squeeze(1)
-        
-        # Restore original shapes for saved tensors
-        Q = Q.view(batch, n_heads, seq_len_q, d_head)
-        K = K.view(batch, n_heads, seq_len_k, d_head)
-        V = V.view(batch, n_heads, seq_len_k, d_head)
-        
-        if input_is_3d:
-            Q = Q.squeeze(1)
-            K = K.squeeze(1)
-            V = V.squeeze(1)
-        
         # Save for backward
         ctx.save_for_backward(Q, K, V, O, L)
         ctx.is_causal = is_causal
         ctx.scale = scale
-        ctx.input_is_3d = input_is_3d
         
         return O
     
@@ -400,27 +353,12 @@ class FlashAttention2Triton(torch.autograd.Function):
         Q, K, V, O, L = ctx.saved_tensors
         is_causal = ctx.is_causal
         scale = ctx.scale
-        input_is_3d = ctx.input_is_3d
         
-        # Add head dimension if needed
-        if input_is_3d:
-            Q = Q.unsqueeze(1)
-            K = K.unsqueeze(1)
-            V = V.unsqueeze(1)
-            O = O.unsqueeze(1)
-            L = L.unsqueeze(1)
-            dO = dO.unsqueeze(1)
         
         # Use compiled backward function
         dQ, dK, dV = flash_attention_backward_compiled(
             Q, K, V, O, dO, L, scale, is_causal
         )
-        
-        # Remove head dimension if input was 3D
-        if input_is_3d:
-            dQ = dQ.squeeze(1)
-            dK = dK.squeeze(1)
-            dV = dV.squeeze(1)
         
         return dQ, dK, dV, None
 
@@ -443,11 +381,11 @@ def flash_attention_backward_fn(Q, K, V, O, dO, L, scale, is_causal):
     Returns:
         dQ, dK, dV
     """
-    batch, n_heads, seq_len_q, d_head = Q.shape
-    _, _, seq_len_k, _ = K.shape
+    batch, seq_len_q, d_head = Q.shape
+    _, seq_len_k, _ = K.shape
     
     # Pre-compute D = rowsum(O * dO)
-    D = (O * dO).sum(dim=-1, keepdim=True)  # [batch, n_heads, seq_len_q, 1]
+    D = torch.sum(O * dO, dim=-1, keepdim=True)  # [batch, seq_len_q, 1]
     
     # Recompute attention scores: S = Q @ K^T / sqrt(d)
     S = torch.matmul(Q, K.transpose(-2, -1)) * scale
@@ -461,7 +399,7 @@ def flash_attention_backward_fn(Q, K, V, O, dO, L, scale, is_causal):
         S = S.masked_fill(~mask, float(-1e6))
     
     # Recompute attention weights using saved L: P = exp(S - L)
-    P = torch.exp(S - L.unsqueeze(-1))  # [batch, n_heads, seq_len_q, seq_len_k]
+    P = torch.exp(S - L.unsqueeze(-1))  # [batch, seq_len_q, seq_len_k]
     
     # Compute gradients
     # dV = P^T @ dO
