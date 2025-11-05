@@ -138,6 +138,9 @@ class FlashAttention2PyTorch(torch.autograd.Function):
 # Part (b): Triton Kernel for FlashAttention-2 Forward Pass
 # ============================================================================
 
+import triton
+import triton.language as tl
+
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr, K_ptr, V_ptr,
@@ -155,123 +158,127 @@ def flash_fwd_kernel(
     is_causal: tl.constexpr,
 ):
     """
-    FlashAttention-2 forward kernel using advance() as required
+    FlashAttention-2 forward kernel using .advance() on block pointers.
+    Each program instance processes one query tile for one batch element.
     """
-    # Program indices
+
+    # program ids
     query_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)
-    
-    # Create block pointers
+
+    # compute q start and q indices (for causal mask)
+    q_start = query_tile_index * Q_TILE_SIZE
+    q_indices = q_start + tl.arange(0, Q_TILE_SIZE)           # shape [Q_TILE_SIZE]
+
+    # make block pointer for Q tile (offset at q_start)
     Q_block_ptr = tl.make_block_ptr(
-        Q_ptr + batch_index * stride_qb,
+        base=Q_ptr + batch_index * stride_qb,
         shape=(N_QUERIES, D),
         strides=(stride_qq, stride_qd),
-        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        offsets=(q_start, 0),
         block_shape=(Q_TILE_SIZE, D),
         order=(1, 0),
     )
-    
+    # load Q with boundary_check and zero padding
+    Q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")  # [Q_TILE_SIZE, D]
+
+    # make initial block pointers for K and V (start at 0)
     K_block_ptr = tl.make_block_ptr(
-        K_ptr + batch_index * stride_kb,
+        base=K_ptr + batch_index * stride_kb,
         shape=(N_KEYS, D),
         strides=(stride_kk, stride_kd),
-        offsets=(0, 0), 
+        offsets=(0, 0),
         block_shape=(K_TILE_SIZE, D),
         order=(1, 0),
     )
-    
     V_block_ptr = tl.make_block_ptr(
-        V_ptr + batch_index * stride_vb,
+        base=V_ptr + batch_index * stride_vb,
         shape=(N_KEYS, D),
         strides=(stride_vk, stride_vd),
-        offsets=(0, 0),  
+        offsets=(0, 0),
         block_shape=(K_TILE_SIZE, D),
         order=(1, 0),
     )
-    
-    O_block_ptr = tl.make_block_ptr(
-        O_ptr + batch_index * stride_ob,
-        shape=(N_QUERIES, D),
-        strides=(stride_oq, stride_od),
-        offsets=(query_tile_index * Q_TILE_SIZE, 0),
-        block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
-    )
-    
-    L_block_ptr = tl.make_block_ptr(
-        L_ptr + batch_index * stride_lb,
-        shape=(N_QUERIES,),
-        strides=(stride_lq,),
-        offsets=(query_tile_index * Q_TILE_SIZE,),
-        block_shape=(Q_TILE_SIZE,),
-        order=(0,),
-    )
-    
-    # Load Q tile 
-    Q = tl.load(Q_block_ptr, boundary_check=(0, 1))
-    
-    # Initialize accumulators 
+
+    # accumulators (use float32 for precision)
     O_accum = tl.zeros([Q_TILE_SIZE, D], dtype=tl.float32)
+    m = tl.full([Q_TILE_SIZE], float('-inf'), dtype=tl.float32)
     l = tl.zeros([Q_TILE_SIZE], dtype=tl.float32)
-    m = tl.full([Q_TILE_SIZE], value=-1e6, dtype=tl.float32) 
-    
-    # Query indices for causal masking
-    q_offset = query_tile_index * Q_TILE_SIZE
-    q_indices = q_offset + tl.arange(0, Q_TILE_SIZE)
-    
-    # Loop over key tiles
+
+    # number of key tiles
     num_k_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
-    
+
+    # iterate over key tiles, advancing the block pointers
     for k_tile_idx in range(num_k_tiles):
+        # compute k_start and size of this tile (used for mask logic if needed later)
         k_start = k_tile_idx * K_TILE_SIZE
-        k_size = tl.minimum(K_TILE_SIZE, N_KEYS - k_start)
-        
-        # Load with manual mask
-        K_tile = tl.load(
-            K_block_ptr,
-            mask=tl.arange(0, K_TILE_SIZE)[:, None] < k_size,
-            other=0.0
-        )
-        V_tile = tl.load(
-            V_block_ptr,
-            mask=tl.arange(0, K_TILE_SIZE)[:, None] < k_size,
-            other=0.0
-        )
-        
+        # load K and V for this tile using block pointers (boundary_check + zero padding)
+        K_tile = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # [K_TILE_SIZE, D]
+        V_tile = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")  # [K_TILE_SIZE, D]
+
+        # compute S = Q @ K^T  --> shape [Q_TILE_SIZE, K_TILE_SIZE]
         S = tl.dot(Q, tl.trans(K_tile)) * scale
-        
-        # Apply causal mask if needed
+
+        # causal mask: positions where q_idx < k_idx are invalid
         if is_causal:
             k_indices = k_start + tl.arange(0, K_TILE_SIZE)
             causal_mask = q_indices[:, None] >= k_indices[None, :]
+            # use a large negative value consistent with tests
             S = tl.where(causal_mask, S, -1e6)
-        
-        # FlashAttention algorithm
-        m_new = tl.maximum(m, tl.max(S, axis=1))
+
+        # stable incremental softmax (FlashAttention style)
+        # m_new = max(m, rowmax(S))
+        s_row_max = tl.max(S, axis=1)  # shape [Q_TILE_SIZE]
+        m_new = tl.maximum(m, s_row_max)
+
+        # P_tilde = exp(S - m_new[:, None])
         P_tilde = tl.exp(S - m_new[:, None])
+
+        # l_new = exp(m - m_new) * l + rowsum(P_tilde)
         l_new = tl.exp(m - m_new) * l + tl.sum(P_tilde, axis=1)
-        
-        # Update output
-        scale_factor = tl.exp(m - m_new)
+
+        # O_accum = diag(exp(m - m_new)) @ O_accum + P_tilde @ V_tile
+        scale_factor = tl.exp(m - m_new)  # [Q_TILE_SIZE]
         O_accum = O_accum * scale_factor[:, None]
-        O_accum += tl.dot(P_tilde.to(V_tile.dtype), V_tile)
-        
-        # Update statistics
+        # perform matmul; ensure accumulation in float32
+        O_accum += tl.dot(P_tilde.to(tl.float32), V_tile.to(tl.float32))
+
+        # update m, l
         m = m_new
         l = l_new
-        
-        # Advance K, V block pointers
+
+        # advance block pointers by K_TILE_SIZE rows for next tile
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
-    
-    # Final normalization
+
+    # final output: O = O_accum / l[:, None]
     O_final = O_accum / l[:, None]
+
+    # logsumexp L = m + log(l)
     L_final = m + tl.log(l)
-    
-    # Store results
-    O_final = O_final.to(O_block_ptr.type.element_ty)
-    tl.store(O_block_ptr, O_final, boundary_check=(0, 1))
-    tl.store(L_block_ptr, L_final, boundary_check=(0,))
+
+    # build block pointers for outputs (offset q_start)
+    O_block_ptr = tl.make_block_ptr(
+        base=O_ptr + batch_index * stride_ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(q_start, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    L_block_ptr = tl.make_block_ptr(
+        base=L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(q_start,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    # cast outputs to output element type and store (use boundary checks)
+    O_out = O_final.to(O_block_ptr.type.element_ty)
+    tl.store(O_block_ptr, O_out, boundary_check=(0, 1), padding_option="zero")
+    tl.store(L_block_ptr, L_final, boundary_check=(0,), padding_option="zero")
 
 
 class FlashAttention2Triton(torch.autograd.Function):
