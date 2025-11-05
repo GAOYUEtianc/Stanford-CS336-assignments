@@ -223,19 +223,28 @@ def flash_fwd_kernel(
     num_k_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
     
     for k_tile_idx in range(num_k_tiles):
-        # Load K, V tiles
-        K_tile = tl.load(K_block_ptr, boundary_check=(0, 1))
-        V_tile = tl.load(V_block_ptr, boundary_check=(0, 1))
+        k_start = k_tile_idx * K_TILE_SIZE
+        k_size = tl.minimum(K_TILE_SIZE, N_KEYS - k_start)
         
-        # Compute attention scores
+        # Load with manual mask
+        K_tile = tl.load(
+            K_block_ptr,
+            mask=tl.arange(0, K_TILE_SIZE)[:, None] < k_size,
+            other=0.0
+        )
+        V_tile = tl.load(
+            V_block_ptr,
+            mask=tl.arange(0, K_TILE_SIZE)[:, None] < k_size,
+            other=0.0
+        )
+        
         S = tl.dot(Q, tl.trans(K_tile)) * scale
         
         # Apply causal mask if needed
         if is_causal:
-            k_offset = k_tile_idx * K_TILE_SIZE
-            k_indices = k_offset + tl.arange(0, K_TILE_SIZE)
+            k_indices = k_start + tl.arange(0, K_TILE_SIZE)
             causal_mask = q_indices[:, None] >= k_indices[None, :]
-            S = tl.where(causal_mask, S, -1e6)  
+            S = tl.where(causal_mask, S, -1e6)
         
         # FlashAttention algorithm
         m_new = tl.maximum(m, tl.max(S, axis=1))
