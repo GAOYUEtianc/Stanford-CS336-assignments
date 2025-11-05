@@ -277,8 +277,8 @@ def flash_fwd_kernel(
 
     # cast outputs to output element type and store (use boundary checks)
     O_out = O_final.to(O_block_ptr.type.element_ty)
-    tl.store(O_block_ptr, O_out, boundary_check=(0, 1), padding_option="zero")
-    tl.store(L_block_ptr, L_final, boundary_check=(0,), padding_option="zero")
+    tl.store(O_block_ptr, O_out, boundary_check=(0, 1))
+    tl.store(L_block_ptr, L_final, boundary_check=(0,))
 
 
 class FlashAttention2Triton(torch.autograd.Function):
