@@ -1,17 +1,29 @@
 import torch
+import torch.nn as nn
+from torch.autograd import Function
 import triton
 import numpy as np
 from typing import List, Tuple
 import pandas as pd
 from itertools import product
+import sys
+import os
 
 # Import your FlashAttention implementation
+# Adjust the import path based on your project structure
 try:
     from flashattention2 import FlashAttention2Triton
     FLASH_AVAILABLE = True
 except ImportError:
-    print("Warning: FlashAttention2Triton not found. Please ensure it's in your Python path.")
-    FLASH_AVAILABLE = False
+    try:
+        # Try alternative import paths
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        from flashattention2 import FlashAttention2Triton
+        FLASH_AVAILABLE = True
+    except ImportError:
+        print("Warning: FlashAttention2Triton not found. Please ensure it's in your Python path.")
+        print("Current sys.path:", sys.path[:3])
+        FLASH_AVAILABLE = False
 
 
 def pytorch_attention_forward_backward(Q, K, V, mask=None):
