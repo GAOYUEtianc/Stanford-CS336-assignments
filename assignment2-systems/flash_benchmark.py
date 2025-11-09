@@ -1,278 +1,322 @@
+#!/usr/bin/env python3
+"""
+FlashAttention-2 vs PyTorch Attention Benchmarking Script
+Requires: torch, triton, pandas, numpy
+"""
+
 import torch
 import torch.nn as nn
-from torch.autograd import Function
 import triton
 import numpy as np
-from typing import List, Tuple
+from typing import List, Optional
 import pandas as pd
 from itertools import product
 import sys
 import os
 
-# Import your FlashAttention implementation
-# Adjust the import path based on your project structure
+# ============================================================================
+# STEP 1: Import your FlashAttention implementation
+# ============================================================================
+# TODO: Adjust this import to match your project structure
+# Option A: If flashattention2.py is in the same directory
 try:
     from flashattention2 import FlashAttention2Triton
     FLASH_AVAILABLE = True
-except ImportError:
+    print("✓ FlashAttention2Triton imported successfully")
+except ImportError as e:
+    print(f"✗ Failed to import FlashAttention2Triton: {e}")
+    print(f"  Current directory: {os.getcwd()}")
+    print(f"  Python path: {sys.path[:3]}")
+    
+    # Option B: Try to add parent directory to path
     try:
-        # Try alternative import paths
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sys.path.insert(0, parent_dir)
         from flashattention2 import FlashAttention2Triton
         FLASH_AVAILABLE = True
+        print("✓ FlashAttention2Triton imported from parent directory")
     except ImportError:
-        print("Warning: FlashAttention2Triton not found. Please ensure it's in your Python path.")
-        print("Current sys.path:", sys.path[:3])
         FLASH_AVAILABLE = False
+        print("✗ FlashAttention2Triton not available. Only PyTorch benchmarks will run.")
 
 
-def pytorch_attention_forward_backward(Q, K, V, mask=None):
-    """
-    Standard PyTorch scaled dot-product attention with forward and backward.
+# ============================================================================
+# PyTorch Baseline Implementation
+# ============================================================================
+
+class PyTorchAttention(nn.Module):
+    """Standard PyTorch scaled dot-product attention for benchmarking."""
     
-    Args:
-        Q: Query tensor [batch_size, num_heads, seq_len, d_k]
-        K: Key tensor [batch_size, num_heads, seq_len, d_k]
-        V: Value tensor [batch_size, num_heads, seq_len, d_k]
-        mask: Optional causal mask
+    def __init__(self, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
     
-    Returns:
-        Output tensor
-    """
-    d_k = Q.size(-1)
-    
-    # Enable gradient computation
-    Q.requires_grad_(True)
-    K.requires_grad_(True)
-    V.requires_grad_(True)
-    
-    # Forward pass
-    scores = torch.matmul(Q, K.transpose(-2, -1)) / np.sqrt(d_k)
-    
-    if mask is not None:
-        scores = scores.masked_fill(mask == 0, float('-inf'))
-    
-    attention_weights = torch.nn.functional.softmax(scores, dim=-1)
-    output = torch.matmul(attention_weights, V)
-    
-    return output
+    def forward(self, Q, K, V, causal=True):
+        """
+        Args:
+            Q: [batch, seq_len, embed_dim] (3D format to match FlashAttention)
+            K: [batch, seq_len, embed_dim]
+            V: [batch, seq_len, embed_dim]
+            causal: Whether to apply causal masking
+        Returns:
+            output: [batch, seq_len, embed_dim]
+        """
+        batch_size, seq_len, embed_dim = Q.shape
+        d_k = embed_dim // self.num_heads
+        
+        # Reshape to [batch, num_heads, seq_len, d_k]
+        Q = Q.view(batch_size, seq_len, self.num_heads, d_k).transpose(1, 2)
+        K = K.view(batch_size, seq_len, self.num_heads, d_k).transpose(1, 2)
+        V = V.view(batch_size, seq_len, self.num_heads, d_k).transpose(1, 2)
+        
+        # Compute attention scores
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / np.sqrt(d_k)
+        
+        # Apply causal mask
+        if causal:
+            mask = torch.tril(torch.ones(seq_len, seq_len, device=Q.device, dtype=torch.bool))
+            scores = scores.masked_fill(~mask, float('-inf'))
+        
+        # Softmax and weighted sum
+        attn_weights = torch.nn.functional.softmax(scores, dim=-1)
+        output = torch.matmul(attn_weights, V)
+        
+        # Reshape back to [batch, seq_len, embed_dim]
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, embed_dim)
+        
+        return output
 
 
-def create_causal_mask(seq_len: int, device: str) -> torch.Tensor:
-    """Create a causal mask for attention."""
-    mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
-    return mask
+# ============================================================================
+# Benchmarking Functions
+# ============================================================================
+
+def benchmark_forward_only(fn, *args, warmup=25, rep=100):
+    """Benchmark forward pass only using triton.testing.do_bench."""
+    return triton.testing.do_bench(lambda: fn(*args), warmup=warmup, rep=rep)
 
 
-def benchmark_forward(fn, *args, **kwargs):
-    """Benchmark forward pass only."""
-    return triton.testing.do_bench(lambda: fn(*args, **kwargs))
-
-
-def benchmark_backward(fn, output_shape, *args, **kwargs):
+def benchmark_backward_only(fn, output_shape, *args, warmup=25, rep=100):
     """Benchmark backward pass only."""
     def backward_fn():
-        output = fn(*args, **kwargs)
+        # Clone inputs to avoid accumulation
+        inputs = [arg.clone().detach().requires_grad_(True) if isinstance(arg, torch.Tensor) and arg.requires_grad is not False else arg for arg in args]
+        output = fn(*inputs)
         grad_output = torch.randn_like(output)
-        torch.autograd.backward(output, grad_output)
+        output.backward(grad_output)
     
-    return triton.testing.do_bench(backward_fn)
+    return triton.testing.do_bench(backward_fn, warmup=warmup, rep=rep)
 
 
-def benchmark_forward_backward(fn, output_shape, *args, **kwargs):
+def benchmark_forward_backward(fn, *args, warmup=25, rep=100):
     """Benchmark combined forward and backward pass."""
-    def forward_backward_fn():
-        output = fn(*args, **kwargs)
+    def fwd_bwd_fn():
+        inputs = [arg.clone().detach().requires_grad_(True) if isinstance(arg, torch.Tensor) and arg.requires_grad is not False else arg for arg in args]
+        output = fn(*inputs)
         grad_output = torch.randn_like(output)
-        torch.autograd.backward(output, grad_output)
+        output.backward(grad_output)
     
-    return triton.testing.do_bench(forward_backward_fn)
+    return triton.testing.do_bench(fwd_bwd_fn, warmup=warmup, rep=rep)
 
 
-def run_benchmarks(
-    seq_lengths: List[int],
-    embed_dims: List[int],
-    dtypes: List[torch.dtype],
-    batch_size: int = 1,
-    num_heads: int = 8,
-    device: str = 'cuda'
-):
-    """
-    Run comprehensive benchmarks comparing FlashAttention-2 with PyTorch attention.
+# ============================================================================
+# Main Benchmarking Loop
+# ============================================================================
+
+def run_single_benchmark(seq_len, embed_dim, dtype, batch_size=1, num_heads=8, device='cuda'):
+    """Run benchmark for a single configuration."""
     
-    Args:
-        seq_lengths: List of sequence lengths to test
-        embed_dims: List of embedding dimensions to test
-        dtypes: List of data types to test
-        batch_size: Batch size (default: 1)
-        num_heads: Number of attention heads
-        device: Device to run on
+    d_k = embed_dim // num_heads
     
-    Returns:
-        DataFrame with benchmark results
-    """
-    results = []
+    print(f"  Testing: seq_len={seq_len:>6}, embed_dim={embed_dim:>3}, dtype={str(dtype).split('.')[-1]:<10}", end='')
     
-    print("Starting benchmarks...")
-    print(f"Device: {device}")
-    print(f"Batch size: {batch_size}, Num heads: {num_heads}")
-    print("-" * 80)
-    
-    for seq_len, embed_dim, dtype in product(seq_lengths, embed_dims, dtypes):
-        d_k = embed_dim // num_heads
+    try:
+        # Generate inputs in 3D format: [batch, seq, embed_dim]
+        Q = torch.randn(batch_size, seq_len, embed_dim, device=device, dtype=dtype)
+        K = torch.randn(batch_size, seq_len, embed_dim, device=device, dtype=dtype)
+        V = torch.randn(batch_size, seq_len, embed_dim, device=device, dtype=dtype)
         
-        print(f"\nBenchmarking: seq_len={seq_len}, embed_dim={embed_dim}, dtype={dtype}")
+        # PyTorch baseline
+        pytorch_attn = PyTorchAttention(num_heads=num_heads).to(device)
         
-        # Generate random inputs
-        Q = torch.randn(batch_size, num_heads, seq_len, d_k, device=device, dtype=dtype)
-        K = torch.randn(batch_size, num_heads, seq_len, d_k, device=device, dtype=dtype)
-        V = torch.randn(batch_size, num_heads, seq_len, d_k, device=device, dtype=dtype)
+        # Benchmark PyTorch
+        Q_pt, K_pt, V_pt = Q.clone(), K.clone(), V.clone()
+        Q_pt.requires_grad_(True)
+        K_pt.requires_grad_(True)
+        V_pt.requires_grad_(True)
         
-        # Create causal mask
-        mask = create_causal_mask(seq_len, device)
-        mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
+        pt_forward_time = benchmark_forward_only(pytorch_attn, Q_pt, K_pt, V_pt, True)
+        pt_fwd_bwd_time = benchmark_forward_backward(pytorch_attn, Q_pt, K_pt, V_pt, True)
+        pt_backward_time = pt_fwd_bwd_time - pt_forward_time
         
-        # Clone inputs for fair comparison
-        Q_pt = Q.clone().detach()
-        K_pt = K.clone().detach()
-        V_pt = V.clone().detach()
+        result = {
+            'seq_len': seq_len,
+            'embed_dim': embed_dim,
+            'num_heads': num_heads,
+            'd_k': d_k,
+            'dtype': str(dtype).split('.')[-1],
+            'pt_forward_ms': pt_forward_time,
+            'pt_backward_ms': pt_backward_time,
+            'pt_fwd_bwd_ms': pt_fwd_bwd_time,
+        }
         
-        Q_flash = Q.clone().detach()
-        K_flash = K.clone().detach()
-        V_flash = V.clone().detach()
-        
-        try:
-            # Benchmark PyTorch implementation
-            print("  Benchmarking PyTorch...")
+        # Benchmark FlashAttention if available
+        if FLASH_AVAILABLE:
+            Q_flash, K_flash, V_flash = Q.clone(), K.clone(), V.clone()
+            Q_flash.requires_grad_(True)
+            K_flash.requires_grad_(True)
+            V_flash.requires_grad_(True)
             
-            # Forward only
-            pt_forward_time = benchmark_forward(
-                pytorch_attention_forward_backward,
-                Q_pt, K_pt, V_pt, mask
+            # FlashAttention expects 3D: [batch, seq, embed_dim]
+            flash_forward_time = benchmark_forward_only(
+                FlashAttention2Triton.apply, Q_flash, K_flash, V_flash, True
             )
-            
-            # Forward + Backward
-            pt_fwd_bwd_time = benchmark_forward_backward(
-                pytorch_attention_forward_backward,
-                (batch_size, num_heads, seq_len, d_k),
-                Q_pt.clone().detach(), 
-                K_pt.clone().detach(), 
-                V_pt.clone().detach(), 
-                mask
+            flash_fwd_bwd_time = benchmark_forward_backward(
+                FlashAttention2Triton.apply, Q_flash, K_flash, V_flash, True
             )
+            flash_backward_time = flash_fwd_bwd_time - flash_forward_time
             
-            # Backward only (approximation)
-            pt_backward_time = pt_fwd_bwd_time - pt_forward_time
-            
-            # Benchmark FlashAttention-2 if available
-            if FLASH_AVAILABLE:
-                print("  Benchmarking FlashAttention-2...")
-                
-                # Forward only
-                flash_forward_time = benchmark_forward(
-                    FlashAttention2Triton.apply,
-                    Q_flash, K_flash, V_flash, True  # causal=True
-                )
-                
-                # Forward + Backward
-                flash_fwd_bwd_time = benchmark_forward_backward(
-                    FlashAttention2Triton.apply,
-                    (batch_size, num_heads, seq_len, d_k),
-                    Q_flash.clone().detach(),
-                    K_flash.clone().detach(),
-                    V_flash.clone().detach(),
-                    True  # causal=True
-                )
-                
-                # Backward only (approximation)
-                flash_backward_time = flash_fwd_bwd_time - flash_forward_time
-                
-                # Calculate speedups
-                speedup_forward = pt_forward_time / flash_forward_time
-                speedup_backward = pt_backward_time / flash_backward_time
-                speedup_fwd_bwd = pt_fwd_bwd_time / flash_fwd_bwd_time
-            else:
-                flash_forward_time = None
-                flash_backward_time = None
-                flash_fwd_bwd_time = None
-                speedup_forward = None
-                speedup_backward = None
-                speedup_fwd_bwd = None
-            
-            # Store results
-            result = {
-                'seq_len': seq_len,
-                'embed_dim': embed_dim,
-                'dtype': str(dtype).split('.')[-1],
-                'pt_forward_ms': pt_forward_time,
-                'pt_backward_ms': pt_backward_time,
-                'pt_fwd_bwd_ms': pt_fwd_bwd_time,
+            result.update({
                 'flash_forward_ms': flash_forward_time,
                 'flash_backward_ms': flash_backward_time,
                 'flash_fwd_bwd_ms': flash_fwd_bwd_time,
-                'speedup_forward': speedup_forward,
-                'speedup_backward': speedup_backward,
-                'speedup_fwd_bwd': speedup_fwd_bwd
-            }
+                'speedup_forward': pt_forward_time / flash_forward_time,
+                'speedup_backward': pt_backward_time / flash_backward_time,
+                'speedup_fwd_bwd': pt_fwd_bwd_time / flash_fwd_bwd_time,
+            })
             
-            results.append(result)
-            
-            print(f"  PyTorch    - Forward: {pt_forward_time:.3f}ms, Backward: {pt_backward_time:.3f}ms, Fwd+Bwd: {pt_fwd_bwd_time:.3f}ms")
-            if FLASH_AVAILABLE:
-                print(f"  Flash-2    - Forward: {flash_forward_time:.3f}ms, Backward: {flash_backward_time:.3f}ms, Fwd+Bwd: {flash_fwd_bwd_time:.3f}ms")
-                print(f"  Speedup    - Forward: {speedup_forward:.2f}x, Backward: {speedup_backward:.2f}x, Fwd+Bwd: {speedup_fwd_bwd:.2f}x")
-            
-        except Exception as e:
-            print(f"  Error: {e}")
-            continue
+            print(f" → Speedup: {result['speedup_fwd_bwd']:.2f}x")
+        else:
+            result.update({
+                'flash_forward_ms': None,
+                'flash_backward_ms': None,
+                'flash_fwd_bwd_ms': None,
+                'speedup_forward': None,
+                'speedup_backward': None,
+                'speedup_fwd_bwd': None,
+            })
+            print(" → Flash not available")
+        
+        return result
+        
+    except Exception as e:
+        print(f" → Error: {e}")
+        return None
+
+
+def run_all_benchmarks(
+    seq_lengths=[128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
+    embed_dims=[16, 32, 64, 128],
+    dtypes=[torch.bfloat16, torch.float32],
+    batch_size=1,
+    num_heads=8,
+    device='cuda'
+):
+    """Run benchmarks across all configurations."""
     
-    # Convert to DataFrame
-    df = pd.DataFrame(results)
-    return df
+    print("=" * 100)
+    print("FlashAttention-2 Benchmarking")
+    print("=" * 100)
+    print(f"Device: {device}")
+    print(f"Batch size: {batch_size}")
+    print(f"Num heads: {num_heads}")
+    print(f"FlashAttention available: {FLASH_AVAILABLE}")
+    print("=" * 100)
+    
+    results = []
+    total_configs = len(seq_lengths) * len(embed_dims) * len(dtypes)
+    current = 0
+    
+    for seq_len in seq_lengths:
+        print(f"\nSequence Length: {seq_len}")
+        for embed_dim in embed_dims:
+            for dtype in dtypes:
+                current += 1
+                print(f"[{current}/{total_configs}] ", end='')
+                
+                result = run_single_benchmark(
+                    seq_len=seq_len,
+                    embed_dim=embed_dim,
+                    dtype=dtype,
+                    batch_size=batch_size,
+                    num_heads=num_heads,
+                    device=device
+                )
+                
+                if result is not None:
+                    results.append(result)
+    
+    return pd.DataFrame(results)
 
 
-def format_results_table(df: pd.DataFrame) -> str:
-    """Format results as a nice LaTeX-style table."""
+# ============================================================================
+# Results Formatting and Display
+# ============================================================================
+
+def print_results_table(df):
+    """Print formatted results table."""
     if df.empty:
-        return "No results to display"
+        print("No results to display")
+        return
     
-    # Create formatted table
-    table = []
-    table.append("=" * 150)
-    table.append(f"{'Seq Len':<10} {'Embed':<8} {'Dtype':<10} {'PyTorch Fwd':<15} {'PyTorch Bwd':<15} {'PyTorch F+B':<15} {'Flash Fwd':<15} {'Flash Bwd':<15} {'Flash F+B':<15} {'Speedup':<10}")
-    table.append("=" * 150)
+    print("\n" + "=" * 160)
+    print(f"{'SeqLen':<8} {'Embed':<7} {'Heads':<6} {'d_k':<5} {'Dtype':<10} "
+          f"{'PT-Fwd':<10} {'PT-Bwd':<10} {'PT-F+B':<10} "
+          f"{'FA-Fwd':<10} {'FA-Bwd':<10} {'FA-F+B':<10} {'Speedup':<8}")
+    print("=" * 160)
     
     for _, row in df.iterrows():
-        speedup_str = f"{row['speedup_fwd_bwd']:.2f}x" if row['speedup_fwd_bwd'] is not None else "N/A"
-        flash_fwd = f"{row['flash_forward_ms']:.3f}ms" if row['flash_forward_ms'] is not None else "N/A"
-        flash_bwd = f"{row['flash_backward_ms']:.3f}ms" if row['flash_backward_ms'] is not None else "N/A"
-        flash_fb = f"{row['flash_fwd_bwd_ms']:.3f}ms" if row['flash_fwd_bwd_ms'] is not None else "N/A"
+        flash_fwd = f"{row['flash_forward_ms']:.2f}" if pd.notna(row['flash_forward_ms']) else "N/A"
+        flash_bwd = f"{row['flash_backward_ms']:.2f}" if pd.notna(row['flash_backward_ms']) else "N/A"
+        flash_fb = f"{row['flash_fwd_bwd_ms']:.2f}" if pd.notna(row['flash_fwd_bwd_ms']) else "N/A"
+        speedup = f"{row['speedup_fwd_bwd']:.2f}x" if pd.notna(row['speedup_fwd_bwd']) else "N/A"
         
-        table.append(
-            f"{row['seq_len']:<10} {row['embed_dim']:<8} {row['dtype']:<10} "
-            f"{row['pt_forward_ms']:<15.3f} {row['pt_backward_ms']:<15.3f} {row['pt_fwd_bwd_ms']:<15.3f} "
-            f"{flash_fwd:<15} {flash_bwd:<15} {flash_fb:<15} {speedup_str:<10}"
-        )
+        print(f"{row['seq_len']:<8} {row['embed_dim']:<7} {row['num_heads']:<6} {row['d_k']:<5} {row['dtype']:<10} "
+              f"{row['pt_forward_ms']:<10.2f} {row['pt_backward_ms']:<10.2f} {row['pt_fwd_bwd_ms']:<10.2f} "
+              f"{flash_fwd:<10} {flash_bwd:<10} {flash_fb:<10} {speedup:<8}")
     
-    table.append("=" * 150)
-    
-    return "\n".join(table)
+    print("=" * 160)
 
+
+def print_summary_stats(df):
+    """Print summary statistics."""
+    if df.empty or not FLASH_AVAILABLE:
+        return
+    
+    valid_speedups = df[df['speedup_fwd_bwd'].notna()]
+    
+    if not valid_speedups.empty:
+        print("\n" + "=" * 60)
+        print("Summary Statistics (Forward + Backward)")
+        print("=" * 60)
+        print(f"Average Speedup: {valid_speedups['speedup_fwd_bwd'].mean():.2f}x")
+        print(f"Median Speedup:  {valid_speedups['speedup_fwd_bwd'].median():.2f}x")
+        print(f"Max Speedup:     {valid_speedups['speedup_fwd_bwd'].max():.2f}x")
+        print(f"Min Speedup:     {valid_speedups['speedup_fwd_bwd'].min():.2f}x")
+        print("=" * 60)
+
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
 
 def main():
     """Main benchmarking script."""
+    
+    # Check CUDA availability
+    if not torch.cuda.is_available():
+        print("ERROR: CUDA not available. This benchmark requires a GPU.")
+        sys.exit(1)
+    
+    device = 'cuda'
+    
     # Configuration
     seq_lengths = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
     embed_dims = [16, 32, 64, 128]
     dtypes = [torch.bfloat16, torch.float32]
     
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    if device == 'cpu':
-        print("Warning: Running on CPU. Results may not be representative.")
-    
     # Run benchmarks
-    results_df = run_benchmarks(
+    results_df = run_all_benchmarks(
         seq_lengths=seq_lengths,
         embed_dims=embed_dims,
         dtypes=dtypes,
@@ -281,20 +325,22 @@ def main():
         device=device
     )
     
+    # Display results
+    print_results_table(results_df)
+    print_summary_stats(results_df)
+    
     # Save results
-    results_df.to_csv('flash_attention_benchmark_results.csv', index=False)
-    print("\n\nResults saved to 'flash_attention_benchmark_results.csv'")
+    output_file = 'flash_attention_benchmark_results.csv'
+    results_df.to_csv(output_file, index=False)
+    print(f"\n✓ Results saved to '{output_file}'")
     
-    # Print formatted table
-    print("\n\nBenchmark Results:")
-    print(format_results_table(results_df))
-    
-    # Print summary statistics
-    if not results_df.empty and 'speedup_fwd_bwd' in results_df.columns:
-        print("\n\nSummary Statistics:")
-        print(f"Average Forward+Backward Speedup: {results_df['speedup_fwd_bwd'].mean():.2f}x")
-        print(f"Max Forward+Backward Speedup: {results_df['speedup_fwd_bwd'].max():.2f}x")
-        print(f"Min Forward+Backward Speedup: {results_df['speedup_fwd_bwd'].min():.2f}x")
+    # Create a simplified table for the report
+    if FLASH_AVAILABLE:
+        report_df = results_df[['seq_len', 'embed_dim', 'dtype', 
+                                'pt_fwd_bwd_ms', 'flash_fwd_bwd_ms', 'speedup_fwd_bwd']]
+        report_file = 'flash_attention_report_table.csv'
+        report_df.to_csv(report_file, index=False)
+        print(f"✓ Simplified report table saved to '{report_file}'")
 
 
 if __name__ == "__main__":
