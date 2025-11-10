@@ -15,12 +15,10 @@ from typing import List, Dict, Tuple
 import argparse
 
 
-def setup(rank: int, world_size:int, backend:str):
-    """
-    Initialize the distributed environment.
-    """
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '29500'
+def setup(rank: int, world_size: int, backend: str):
+    """Initialize the distributed environment."""
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29500"
     
     # Initialize process group
     dist.init_process_group(backend, rank=rank, world_size=world_size)
@@ -28,35 +26,16 @@ def setup(rank: int, world_size:int, backend:str):
     # Set device for GPU backends
     if backend == "nccl":
         torch.cuda.set_device(rank)
-        
-        
+
+
 def cleanup():
     """Clean up the distributed environment."""
     dist.destroy_process_group()
-    
 
-def benchmark_allreduce(
-    rank: int,
-    world_size: int,
-    backend: str,
-    data_size_mb: float,
-    num_iterations: int = 100,
-    warmup_iterations: int = 5
-):
-    """
-    Benchmark all-reduce operation for a single configuration.
-    
-    Args:
-        rank: Process rank
-        world_size: Total number of processes
-        backend: Communication backend ('gloo' or 'nccl')
-        data_size_mb: Size of data tensor in MB
-        num_iterations: Number of timed iterations
-        warmup_iterations: Number of warmup iterations
-        
-    Returns:
-        Dictionary with benchmark results.
-    """
+
+# Global worker function (must be at module level for pickle)
+def _benchmark_worker(rank, world_size, backend, data_size_mb, num_iterations, warmup_iterations, return_dict):
+    """Worker function for benchmarking (must be at module level for multiprocessing)."""
     setup(rank, world_size, backend)
     
     # Determine device
@@ -64,11 +43,12 @@ def benchmark_allreduce(
         device = f"cuda:{rank}"
     else:
         device = "cpu"
-        
+    
     # Calculate tensor size
     # float32 = 4 bytes, so for X MB: X * 1024 * 1024 / 4 elements
     num_elements = int(data_size_mb * 1024 * 1024 / 4)
     
+    # Create random tensor
     data = torch.randn(num_elements, dtype=torch.float32, device=device)
     
     # Warmup iterations
@@ -76,9 +56,10 @@ def benchmark_allreduce(
         dist.all_reduce(data, op=dist.ReduceOp.SUM, async_op=False)
         if backend == "nccl":
             torch.cuda.synchronize(device)
-            
+    
     # Benchmark iterations
     timings = []
+    
     for _ in range(num_iterations):
         # Start timing
         if backend == "nccl":
@@ -86,7 +67,7 @@ def benchmark_allreduce(
             start_time = time.perf_counter()
         else:
             start_time = time.perf_counter()
-            
+        
         # All-reduce operation
         dist.all_reduce(data, op=dist.ReduceOp.SUM, async_op=False)
         
@@ -99,17 +80,17 @@ def benchmark_allreduce(
         
         elapsed_ms = (end_time - start_time) * 1000
         timings.append(elapsed_ms)
-        
+    
     # Convert timings to tensor for gathering
     local_timings = torch.tensor(timings, dtype=torch.float32, device=device)
     
-    # Gather timings to rank 0
+    # Gather all timings to rank 0
     if rank == 0:
         gathered_timings = [torch.zeros_like(local_timings) for _ in range(world_size)]
     else:
         gathered_timings = None
     
-    dist.gather(local_timings, gather_lsit=gathered_timings, dst=0)
+    dist.gather(local_timings, gather_list=gathered_timings, dst=0)
     
     result = None
     if rank == 0:
@@ -128,16 +109,17 @@ def benchmark_allreduce(
             'median_time_ms': np.median(all_timings),
             'bandwidth_gbps': (data_size_mb * world_size) / (np.mean(all_timings) / 1000) / 1024,
         }
+        return_dict['result'] = result
     
     cleanup()
-    return result
 
 
 def run_benchmark_config(
     world_size: int,
     backend: str,
     data_size_mb: float,
-    num_iterations: int = 100
+    num_iterations: int = 100,
+    warmup_iterations: int = 5
 ):
     """
     Run benchmark for a single configuration using multiprocessing.
@@ -147,6 +129,7 @@ def run_benchmark_config(
         backend: Communication backend
         data_size_mb: Data size in MB
         num_iterations: Number of iterations
+        warmup_iterations: Number of warmup iterations
     
     Returns:
         Benchmark results dictionary
@@ -155,15 +138,10 @@ def run_benchmark_config(
     manager = mp.Manager()
     return_dict = manager.dict()
     
-    def worker_wrapper(rank, world_size, backend, data_size_mb, num_iterations, return_dict):
-        result = benchmark_allreduce(rank, world_size, backend, data_size_mb, num_iterations)
-        if result is not None:
-            return_dict['result'] = result
-        
     # Spawn processes
     mp.spawn(
-        fn=worker_wrapper,
-        args=(world_size, backend, data_size_mb, num_iterations, return_dict),
+        fn=_benchmark_worker,
+        args=(world_size, backend, data_size_mb, num_iterations, warmup_iterations, return_dict),
         nprocs=world_size,
         join=True
     )
@@ -178,7 +156,7 @@ def run_all_benchmarks(
     num_iterations: int = 100
 ) -> pd.DataFrame:
     """
-    Run benchmarks across all configurations and collect results.
+    Run benchmarks for all configurations.
     
     Args:
         backends_configs: List of (backend, device) tuples
@@ -189,9 +167,8 @@ def run_all_benchmarks(
     Returns:
         DataFrame with all benchmark results
     """
-        
     results = []
-    total_configs = len(world_sizes) * len(backends_configs) * len(data_sizes_mb)
+    total_configs = len(backends_configs) * len(data_sizes_mb) * len(world_sizes)
     current = 0
     
     print("=" * 80)
@@ -220,15 +197,16 @@ def run_all_benchmarks(
                         data_size_mb=data_size_mb,
                         num_iterations=num_iterations
                     )
+                    
                     if result is not None:
                         results.append(result)
                         print(f"✓ {result['mean_time_ms']:.2f} ms (BW: {result['bandwidth_gbps']:.2f} GB/s)")
                     else:
                         print("✗ No result returned")
-                        
+                
                 except Exception as e:
                     print(f"✗ Error: {e}")
-                    
+    
     return pd.DataFrame(results)
 
 
@@ -241,6 +219,7 @@ def plot_results(df: pd.DataFrame, output_dir: str = '.'):
         output_dir: Directory to save plots
     """
     os.makedirs(output_dir, exist_ok=True)
+    
     # Plot 1: Latency vs Data Size (grouped by backend and world size)
     fig, axes = plt.subplots(1, 2, figsize=(15, 5))
     
@@ -250,6 +229,7 @@ def plot_results(df: pd.DataFrame, output_dir: str = '.'):
         for world_size in sorted(subset['world_size'].unique()):
             data = subset[subset['world_size'] == world_size]
             label = f"{backend_device.upper()} (n={world_size})"
+            
             axes[0].plot(
                 data['data_size_mb'],
                 data['mean_time_ms'],
@@ -335,8 +315,8 @@ def print_summary_table(df: pd.DataFrame):
               f"{row['std_time_ms']:<12.3f} {row['bandwidth_gbps']:<12.2f}")
     
     print("=" * 120)
-    
-    
+
+
 def main():
     """Main benchmarking script."""
     parser = argparse.ArgumentParser(description='Benchmark distributed all-reduce operations')
@@ -362,7 +342,7 @@ def main():
         if num_gpus < max(world_sizes):
             print(f"Warning: Only {num_gpus} GPUs available, adjusting world_sizes")
             world_sizes = [ws for ws in world_sizes if ws <= num_gpus]
-            
+    
     # Run benchmarks
     results_df = run_all_benchmarks(
         backends_configs=backends_configs,
