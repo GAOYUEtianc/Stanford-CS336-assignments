@@ -225,7 +225,7 @@ def _worker_benchmark_overlap(rank: int, world_size: int, backend: str, results)
         def __init__(self):
             super().__init__()
             self.layers = nn.ModuleList([
-                nn.Linear(128, 128) for _ in range(100)
+                nn.Linear(1024, 1024) for _ in range(100)
             ])
             
         def forward(self, x):
@@ -241,8 +241,8 @@ def _worker_benchmark_overlap(rank: int, world_size: int, backend: str, results)
     loss_fn = nn.MSELoss()
     
     torch.manual_seed(42)
-    x = torch.randn(32, 128, device=device)
-    y = torch.randn(32, 128, device=device)
+    x = torch.randn(32, 1024, device=device)
+    y = torch.randn(32, 1024, device=device)
     
     # Warmup
     for _ in range(3):
@@ -315,7 +315,7 @@ def _worker_benchmark_naive(rank: int, world_size: int, backend: str, results):
         def __init__(self):
             super().__init__()
             self.layers = nn.ModuleList([
-                nn.Linear(128, 128) for _ in range(100)
+                nn.Linear(1024, 1024) for _ in range(100)
             ])
             
         def forward(self, x):
@@ -335,8 +335,8 @@ def _worker_benchmark_naive(rank: int, world_size: int, backend: str, results):
     loss_fn = nn.MSELoss()
     
     torch.manual_seed(42)
-    x = torch.randn(32, 128, device=device)
-    y = torch.randn(32, 128, device=device)
+    x = torch.randn(32, 1024, device=device)
+    y = torch.randn(32, 1024, device=device)
     
     # Warmup
     for _ in range(3):
