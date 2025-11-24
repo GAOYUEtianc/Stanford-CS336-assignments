@@ -206,6 +206,13 @@ def _worker_benchmark_overlap(rank: int, world_size: int, backend: str, results)
     os.environ["MASTER_PORT"] = "29701"
     
     if backend == "nccl":
+        os.environ['NCCL_ALGO'] = 'Tree'
+        os.environ['NCCL_PROTO'] = 'LL' 
+        os.environ['NCCL_NSOCKS_PERTHREAD'] = '4'
+        os.environ['NCCL_SOCKET_NTHREADS'] = '4'
+        os.environ['NCCL_BUFFSIZE'] = '4194304'
+        os.environ['NCCL_NTHREADS'] = '512'
+        os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
         torch.cuda.set_device(rank)
         device = f"cuda:{rank}"
@@ -218,7 +225,7 @@ def _worker_benchmark_overlap(rank: int, world_size: int, backend: str, results)
         def __init__(self):
             super().__init__()
             self.layers = nn.ModuleList([
-                nn.Linear(128, 128) for _ in range(50)
+                nn.Linear(128, 128) for _ in range(100)
             ])
             
         def forward(self, x):
@@ -251,23 +258,32 @@ def _worker_benchmark_overlap(rank: int, world_size: int, backend: str, results)
         torch.cuda.synchronize()
     
     num_iters = 20
-    start = time.perf_counter()
+    total_time = 0.0
+    total_comm_time = 0.0
     
     for _ in range(num_iters):
+        iter_start = time.perf_counter()
         optimizer.zero_grad()
         output = ddp_model(x)
         loss = loss_fn(output, y)
+        comm_start = time.perf_counter()
         loss.backward()
         ddp_model.finish_gradient_synchronization()
+        comm_end = time.perf_counter()
         optimizer.step()
+        
+        iter_end = time.perf_counter()
+        
+        total_time += (iter_end - iter_start)
+        total_comm_time += (comm_end - comm_start)
         
         if backend == "nccl":
             torch.cuda.synchronize()
     
-    total_time = time.perf_counter() - start
-    
     if rank == 0:
         results['overlap_time'] = total_time / num_iters * 1000  # ms
+        results['overlap_comm_time'] = total_comm_time / num_iters * 1000  # ms
+        results['overlap_comp_time'] = (total_time - total_comm_time) / num_iters * 1000 
     
     dist.destroy_process_group()
 
@@ -281,6 +297,13 @@ def _worker_benchmark_naive(rank: int, world_size: int, backend: str, results):
     os.environ["MASTER_PORT"] = "29702"
     
     if backend == "nccl":
+        os.environ['NCCL_ALGO'] = 'Tree'
+        os.environ['NCCL_PROTO'] = 'LL' 
+        os.environ['NCCL_NSOCKS_PERTHREAD'] = '4'
+        os.environ['NCCL_SOCKET_NTHREADS'] = '4'
+        os.environ['NCCL_BUFFSIZE'] = '4194304'
+        os.environ['NCCL_NTHREADS'] = '512'
+        os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
         torch.cuda.set_device(rank)
         device = f"cuda:{rank}"
@@ -292,7 +315,7 @@ def _worker_benchmark_naive(rank: int, world_size: int, backend: str, results):
         def __init__(self):
             super().__init__()
             self.layers = nn.ModuleList([
-                nn.Linear(128, 128) for _ in range(50)
+                nn.Linear(128, 128) for _ in range(100)
             ])
             
         def forward(self, x):
@@ -335,28 +358,39 @@ def _worker_benchmark_naive(rank: int, world_size: int, backend: str, results):
         torch.cuda.synchronize()
     
     num_iters = 20
-    start = time.perf_counter()
+    total_time = 0.0
+    total_comm_time = 0.0
     
     for _ in range(num_iters):
+        iter_start = time.perf_counter()
         optimizer.zero_grad()
         output = model(x)
         loss = loss_fn(output, y)
         loss.backward()
         
+        comm_start = time.perf_counter()
+        
         for param in model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
                 param.grad.data /= world_size
+        comm_end = time.perf_counter()
         
         optimizer.step()
+        
+        iter_end = time.perf_counter()
+        
+        total_time += (iter_end - iter_start)
+        total_comm_time += (comm_end - comm_start)
         
         if backend == "nccl":
             torch.cuda.synchronize()
     
-    total_time = time.perf_counter() - start
     
     if rank == 0:
         results['naive_time'] = total_time / num_iters * 1000  # ms
+        results['naive_comm_time'] = total_comm_time / num_iters * 1000  # ms
+        results['naive_comp_time'] = (total_time - total_comm_time) / num_iters * 1000
     
     dist.destroy_process_group()
     
@@ -391,8 +425,7 @@ def benchmark_ddp_overlap():
     print("=" * 80)
     
     # Use GPU if available
-    # backend = "nccl" if torch.cuda.is_available() else "gloo"
-    backend = "gloo"
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
     print(f"Using backend: {backend}")
     
     manager = mp.Manager()
@@ -407,19 +440,21 @@ def benchmark_ddp_overlap():
     
     naive_time = results['naive_time']
     overlap_time = results['overlap_time']
+    naive_comm_time = results['naive_comm_time']
+    overlap_comm_time = results['overlap_comm_time']
+    
     speedup = naive_time / overlap_time
+    comm_reduction = naive_comm_time / overlap_comm_time
     
     print("\n" + "=" * 80)
     print("Results:")
     print("=" * 80)
-    print(f"{'Method':<30} {'Time per Iteration (ms)':<30}")
+    print(f"{'Metric':<25} {'Naive':<15} {'Overlap':<15} {'Improvement':<15}")
     print("-" * 80)
-    print(f"{'Naive (Sequential)':<30} {naive_time:<30.3f}")
-    print(f"{'Overlap (Async Hooks)':<30} {overlap_time:<30.3f}")
+    print(f"{'Total Time (ms)':<25} {naive_time:<15.3f} {overlap_time:<15.3f} {speedup:<15.2f}x")
+    print(f"{'Comm Time (ms)':<25} {naive_comm_time:<15.3f} {overlap_comm_time:<15.3f} {comm_reduction:<15.2f}x")
+    print(f"{'Compute Time (ms)':<25} {results['naive_comp_time']:<15.3f} {results['overlap_comp_time']:<15.3f} {'-':<15}")
     print("=" * 80)
-    print(f"\nSpeedup: {speedup:.2f}x faster")
-    print(f"Time saved: {naive_time - overlap_time:.3f} ms per iteration")
-
 
 # ============================================================================
 # Main
