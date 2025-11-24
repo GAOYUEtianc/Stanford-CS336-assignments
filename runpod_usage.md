@@ -3,6 +3,17 @@
 ```bash
 ssh -i ~/.ssh/id_ed25519 <pod id>@ssh.runpod.io
 ```
+## Check GPU structure
+```
+# Should see NV* (NVLink) instead of PIX/PHB (PCIe)
+nvidia-smi topo -m
+
+# should show NVLink connection
+nvidia-smi nvlink -s
+
+# Check NVLink status
+nvidia-smi nvlink --status
+```
 ## Zip repo and send to pod
 ```bash
 tar --exclude='._*' --exclude='.DS_Store' -czf assignment1.tar.gz assignment1
