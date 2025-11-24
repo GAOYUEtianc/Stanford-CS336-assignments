@@ -1,3 +1,12 @@
+"""
+DDP Implementation with Flattened Gradients
+
+This version improves upon naive DDP by:
+1. Concatenating all parameter gradients into a single flat tensor
+2. Performing only ONE all-reduce operation (instead of one per parameter)
+3. Reducing communication overhead significantly
+"""
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -78,7 +87,7 @@ def ddp_flattened_on_after_backward(
 
 
 # ============================================================================
-# Model Definition (must be at module level for pickle)
+# Model Definitions (must be at module level for pickle)
 # ============================================================================
 
 class BigToyModel(nn.Module):
@@ -281,7 +290,7 @@ def _worker_test(rank: int, world_size: int, use_flattened: bool, results):
 
 
 # ============================================================================
-# Comparison Benchmark: Naive vs Flattened
+# Benchmark Function
 # ============================================================================
 
 def benchmark_ddp_comparison():
@@ -334,59 +343,12 @@ def benchmark_ddp_comparison():
     print(f"  Communication Overhead: Naive {naive_comm/naive_total*100:.1f}% vs Flattened {flat_comm/flat_total*100:.1f}%")
 
 
-
-        import os
-        port = "29602" if use_flattened else "29603"
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = port
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
-        
-        class SimpleModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.fc1 = nn.Linear(10, 20)
-                self.fc2 = nn.Linear(20, 5)
-                
-            def forward(self, x):
-                return self.fc2(torch.relu(self.fc1(x)))
-        
-        torch.manual_seed(0)
-        model = SimpleModel()
-        
-        # Broadcast
-        for param in model.parameters():
-            dist.broadcast(param.data, src=0)
-        
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-        loss_fn = nn.MSELoss()
-        
-        torch.manual_seed(42)
-        x = torch.randn(16, 10)
-        y = torch.randn(16, 5)
-        
-        # Train for a few steps
-        for _ in range(5):
-            optimizer.zero_grad()
-            output = model(x)
-            loss = loss_fn(output, y)
-            loss.backward()
-            
-            if use_flattened:
-                ddp_flattened_on_after_backward(model, optimizer)
-            else:
-                # Naive
-                for param in model.parameters():
-                    if param.grad is not None:
-                        dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
-                        param.grad.data /= world_size
-            
-            optimizer.step()
-        
-        if rank == 0:
-            key = 'flattened' if use_flattened else 'naive'
-            results[key] = {name: param.data.clone() for name, param in model.named_parameters()}
-        
-        dist.destroy_process_group()
+# ============================================================================
+# Test Correctness
+# ============================================================================
+def test_flattened_correctness():
+    """Verify that flattened DDP produces the same results as naive DDP."""
+    import torch.multiprocessing as mp
     
     print("\n" + "=" * 80)
     print("Testing Correctness: Naive vs Flattened")
@@ -397,10 +359,12 @@ def benchmark_ddp_comparison():
     world_size = 2
     
     # Run naive
-    mp.spawn(worker_test, args=(world_size, False, results), nprocs=world_size, join=True)
+    print("Running naive DDP...")
+    mp.spawn(_worker_test, args=(world_size, False, results), nprocs=world_size, join=True)
     
     # Run flattened
-    mp.spawn(worker_test, args=(world_size, True, results), nprocs=world_size, join=True)
+    print("Running flattened DDP...")
+    mp.spawn(_worker_test, args=(world_size, True, results), nprocs=world_size, join=True)
     
     # Compare
     naive_params = results['naive']
@@ -422,104 +386,6 @@ def benchmark_ddp_comparison():
     else:
         print("\n✗ FAILURE: Results differ!")
     
-    return all_match
-
-# ============================================================================
-# Test Correctness
-# ============================================================================
-def test_flattened_correctness():
-    """Verify that flattened DDP produces the same results as naive DDP."""
-    import torch.multiprocessing as mp
-    from copy import deepcopy
-    
-    def worker_test(rank: int, world_size: int, use_flattened: bool, results):
-        import os
-        port = "29602" if use_flattened else "29603"
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = port
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
-        
-        class SimpleModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.fc1 = nn.Linear(10, 20)
-                self.fc2 = nn.Linear(20, 5)
-                
-            def forward(self, x):
-                return self.fc2(torch.relu(self.fc1(x)))
-            
-        torch.manual_seed(0)
-        model = SimpleModel()
-        
-        # Broadcast
-        for param in model.parameters():
-            dist.broadcast(param.data, src=0)
-            
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-        loss_fn = nn.MSELoss()
-        
-        torch.manual_seed(42)
-        x = torch.randn(16, 10)
-        y = torch.randn(16, 5)
-        
-        # Train for a few steps
-        for _ in range(5):
-            optimizer.zero_grad()
-            output = model(x)
-            loss = loss_fn(output, y)
-            loss.backward()
-            
-            if use_flattened:
-                ddp_flattened_on_after_backward(model, optimizer)
-            else:
-                # Naive all-reduce
-                for param in model.parameters():
-                    if param.grad is not None:
-                        dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
-                        param.grad.data /= world_size
-                        
-            optimizer.step()
-            
-        if rank == 0:
-            key = 'flattened' if use_flattened else 'naive'
-            results[key] = {name: param.data.clone() for name, param in model.named_parameters()}
-            
-        dist.destroy_process_group()
-        
-    print("\n" + "=" * 80)
-    print("Testing Correctness: Naive vs Flattened")
-    print("=" * 80)
-    
-    manager = mp.Manager()
-    results = manager.dict()
-    world_size = 2
-    
-    # Run naive
-    mp.spawn(worker_test, args=(world_size, False, results), nprocs=world_size, join=True)
-    
-    # Run flattened
-    mp.spawn(worker_test, args=(world_size, True, results), nprocs=world_size, join=True)
-    
-    # Compare
-    naive_params = results['naive']
-    flat_params = results['flattened']
-    
-    print("\nComparing parameters:")
-    all_match = True
-    for name in naive_params.keys():
-        match = torch.allclose(naive_params[name], flat_params[name], atol=1e-6)
-        status = "✓ MATCH" if match else "✗ MISMATCH"
-        print(f" {name:<30} {status}")
-        if not match:
-            diff = (naive_params[name] - flat_params[name]).abs().max().item()
-            print(f"    Max difference: {diff:.2e}")
-            all_match = False 
-    
-    if all_match:
-        print("\n✓ SUCCESS: Flattened DDP matches Naive DDP!")
-    else:
-        print("\n✗ FAILURE: Flattened DDP does not match Naive DDP.")
-        
     return all_match
     
 # ============================================================================
