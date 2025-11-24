@@ -391,7 +391,8 @@ def benchmark_ddp_overlap():
     print("=" * 80)
     
     # Use GPU if available
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    # backend = "nccl" if torch.cuda.is_available() else "gloo"
+    backend = "gloo"
     print(f"Using backend: {backend}")
     
     manager = mp.Manager()
