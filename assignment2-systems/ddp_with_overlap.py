@@ -222,15 +222,37 @@ def _worker_benchmark_overlap(rank: int, world_size: int, backend: str, results)
         
     # Create a larger model
     class BigModel(nn.Module):
-        def __init__(self):
+        def __init__(self, 
+                 num_layers=48,
+                 hidden=4096, 
+                 ffn_hidden=16384,
+                 input_dim=1024,
+                 output_dim=1024):
             super().__init__()
+            
+            self.input_proj = nn.Linear(input_dim, hidden)
+            
             self.layers = nn.ModuleList([
-                nn.Linear(1024, 1024) for _ in range(100)
+                nn.ModuleList([
+                    nn.Linear(hidden, hidden),      # attention proj (QKVO)
+                    nn.Linear(hidden, hidden),
+                    nn.Linear(hidden, ffn_hidden),  # FFN 1
+                    nn.Linear(ffn_hidden, hidden),  # FFN 2
+                ])
+                for _ in range(num_layers)
             ])
             
+            self.output_proj = nn.Linear(hidden, output_dim)
+            
         def forward(self, x):
-            for layer in self.layers:
-                x = torch.relu(layer(x))
+            x = self.input_proj(x)
+
+            for attn1, attn2, ffn1, ffn2 in self.layers:
+                x = attn1(x)
+                x = attn2(x)
+                x = ffn2(torch.relu(ffn1(x)))
+
+            x = self.output_proj(x)
             return x
     
     torch.manual_seed(0)
@@ -312,15 +334,37 @@ def _worker_benchmark_naive(rank: int, world_size: int, backend: str, results):
         device = "cpu"
         
     class BigModel(nn.Module):
-        def __init__(self):
+        def __init__(self, 
+                 num_layers=48,
+                 hidden=4096, 
+                 ffn_hidden=16384,
+                 input_dim=1024,
+                 output_dim=1024):
             super().__init__()
+            
+            self.input_proj = nn.Linear(input_dim, hidden)
+            
             self.layers = nn.ModuleList([
-                nn.Linear(1024, 1024) for _ in range(100)
+                nn.ModuleList([
+                    nn.Linear(hidden, hidden),      # attention proj (QKVO)
+                    nn.Linear(hidden, hidden),
+                    nn.Linear(hidden, ffn_hidden),  # FFN 1
+                    nn.Linear(ffn_hidden, hidden),  # FFN 2
+                ])
+                for _ in range(num_layers)
             ])
             
+            self.output_proj = nn.Linear(hidden, output_dim)
+            
         def forward(self, x):
-            for layer in self.layers:
-                x = torch.relu(layer(x))
+            x = self.input_proj(x)
+
+            for attn1, attn2, ffn1, ffn2 in self.layers:
+                x = attn1(x)
+                x = attn2(x)
+                x = ffn2(torch.relu(ffn1(x)))
+
+            x = self.output_proj(x)
             return x
         
         
