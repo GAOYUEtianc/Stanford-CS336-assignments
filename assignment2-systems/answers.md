@@ -583,3 +583,20 @@ Reasons for speedup:
 - Operator specialization (optimized for specific shapes)
 - Reduced Python overhead
 ```
+
+## DDP Results
+### 2.2 DDP flatten on \& after backward
+This is the result running on A-100, 2 GPU, communicating with gloo, concatenating all parameter gradients into a single flat tensor, performing only ONE all-reduce operation (instead of one per parameter), hence reducing communication time : 
+```
+================================================================================
+Method               Total Time (ms)      Comm Time (ms)       Compute Time (ms)   
+--------------------------------------------------------------------------------
+Naive (Individual)   285.480              110.965              174.515             
+Flattened (Batched)  244.271              68.141               176.130             
+================================================================================
+
+Speedup (Flattened vs Naive):
+  Total Time: 1.17x faster
+  Communication Time: 1.63x faster
+  Communication Overhead: Naive 38.9% vs Flattened 27.9%
+```
