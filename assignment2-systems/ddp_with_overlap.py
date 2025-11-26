@@ -11,6 +11,15 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from typing import List, Optional, Dict, Any
+import os
+# Import NVTX for profiling
+try:
+    import torch.cuda.nvtx as nvtx
+    NVTX_AVAILABLE = True
+except ImportError:
+    NVTX_AVAILABLE = False
+    print("Warning: NVTX not available")
+
 
 
 class DDP(nn.Module):
@@ -197,7 +206,7 @@ def _worker_correctness_test(rank: int, world_size: int, results):
     dist.destroy_process_group()
     
     
-def _worker_benchmark_overlap(rank: int, world_size: int, backend: str, results):
+def _worker_benchmark_overlap(rank: int, world_size: int, backend: str, results, num_iters=20):
     """Benchmark DDP with overlapping communication."""
     import os
     import time
@@ -279,21 +288,43 @@ def _worker_benchmark_overlap(rank: int, world_size: int, backend: str, results)
     if backend == "nccl":
         torch.cuda.synchronize()
     
-    num_iters = 20
     total_time = 0.0
     total_comm_time = 0.0
     
-    for _ in range(num_iters):
+    for i in range(num_iters):
         iter_start = time.perf_counter()
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_push(f"Iteration {i} - OVERLAP")
+            
         optimizer.zero_grad()
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_push("Forward Pass")
+            
         output = ddp_model(x)
         loss = loss_fn(output, y)
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_pop()  # Forward Pass
+            
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_push("Backward Pass (with async comm)")
         comm_start = time.perf_counter()
         loss.backward()
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_pop()  # Backward Pass
+            
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_push("Wait for Communication")
         ddp_model.finish_gradient_synchronization()
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_pop()  # Wait for Communication
+            
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_push("Optimizer Step")
         comm_end = time.perf_counter()
         optimizer.step()
-        
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_pop()  # Optimizer Step
+            
         iter_end = time.perf_counter()
         
         total_time += (iter_end - iter_start)
@@ -301,7 +332,9 @@ def _worker_benchmark_overlap(rank: int, world_size: int, backend: str, results)
         
         if backend == "nccl":
             torch.cuda.synchronize()
-    
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_pop()  # Iteration
+            
     if rank == 0:
         results['overlap_time'] = total_time / num_iters * 1000  # ms
         results['overlap_comm_time'] = total_comm_time / num_iters * 1000  # ms
@@ -310,7 +343,7 @@ def _worker_benchmark_overlap(rank: int, world_size: int, backend: str, results)
     dist.destroy_process_group()
 
 
-def _worker_benchmark_naive(rank: int, world_size: int, backend: str, results):
+def _worker_benchmark_naive(rank: int, world_size: int, backend: str, results, num_iters=20):
     """Benchmark naive DDP (no overlap)."""
     import os
     import time
@@ -401,26 +434,47 @@ def _worker_benchmark_naive(rank: int, world_size: int, backend: str, results):
     if backend == "nccl":
         torch.cuda.synchronize()
     
-    num_iters = 20
     total_time = 0.0
     total_comm_time = 0.0
     
-    for _ in range(num_iters):
+    for i in range(num_iters):
         iter_start = time.perf_counter()
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_push(f"Iteration {i} - NAIVE")
         optimizer.zero_grad()
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_push("Forward Pass")
+        
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_push("Forward Pass")
         output = model(x)
         loss = loss_fn(output, y)
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_pop()  # Forward Pass
+        
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_push("Backward Pass (compute only)")
         loss.backward()
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_pop()  # Backward Pass
         
         comm_start = time.perf_counter()
         
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_push("All-Reduce Gradients (sequential)")
         for param in model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
                 param.grad.data /= world_size
         comm_end = time.perf_counter()
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_pop()  # All-Reduce
         
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_push("Optimizer Step")
         optimizer.step()
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_pop()  # Optimizer Step
         
         iter_end = time.perf_counter()
         
@@ -430,6 +484,8 @@ def _worker_benchmark_naive(rank: int, world_size: int, backend: str, results):
         if backend == "nccl":
             torch.cuda.synchronize()
     
+        if NVTX_AVAILABLE and backend == "nccl":
+            nvtx.range_pop()  # Iteration
     
     if rank == 0:
         results['naive_time'] = total_time / num_iters * 1000  # ms
@@ -500,19 +556,90 @@ def benchmark_ddp_overlap():
     print(f"{'Compute Time (ms)':<25} {results['naive_comp_time']:<15.3f} {results['overlap_comp_time']:<15.3f} {'-':<15}")
     print("=" * 80)
 
+
+def profile_naive_ddp():
+    """
+    Profile naive DDP for Nsight Systems.
+    Run with: nsys profile -o naive_ddp python your_script.py --profile-naive
+    """
+    import torch.multiprocessing as mp
+    
+    print("=" * 80)
+    print("Profiling Naive DDP (for Nsight Systems)")
+    print("=" * 80)
+    print("This will generate data for nsys profiling")
+    print("Make sure to run with: nsys profile -o naive_ddp python script.py --profile-naive")
+    print("=" * 80)
+    
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if backend != "nccl":
+        print("Warning: NCCL/GPU not available, profiling on CPU with gloo")
+    
+    manager = mp.Manager()
+    results = manager.dict()
+    world_size = 2
+    num_iters = 20
+    
+    mp.spawn(_worker_benchmark_naive, args=(world_size, backend, results, num_iters), nprocs=world_size, join=True)
+    
+    print("\n✓ Naive DDP profiling completed")
+    print("  Check the .nsys-rep or .qdrep file with Nsight Systems")
+
+
+def profile_overlap_ddp():
+    """
+    Profile overlap DDP for Nsight Systems.
+    Run with: nsys profile -o overlap_ddp python your_script.py --profile-overlap
+    """
+    import torch.multiprocessing as mp
+    
+    print("=" * 80)
+    print("Profiling Overlap DDP (for Nsight Systems)")
+    print("=" * 80)
+    print("This will generate data for nsys profiling")
+    print("Make sure to run with: nsys profile -o overlap_ddp python script.py --profile-overlap")
+    print("=" * 80)
+    
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if backend != "nccl":
+        print("Warning: NCCL/GPU not available, profiling on CPU with gloo")
+    
+    manager = mp.Manager()
+    results = manager.dict()
+    world_size = 2
+    num_iters = 20
+    
+    mp.spawn(_worker_benchmark_overlap, args=(world_size, backend, results, num_iters), nprocs=world_size, join=True)
+    
+    print("\n✓ Overlap DDP profiling completed")
+    print("  Check the .nsys-rep or .qdrep file with Nsight Systems")
+    
 # ============================================================================
 # Main
 # ============================================================================
-
 if __name__ == "__main__":
     import torch.multiprocessing as mp
+    import sys
     mp.set_start_method('spawn', force=True)
     
-    print("DDP with Overlapping Communication and Computation")
-    print("=" * 80)
-    
-    # Test correctness
-    test_ddp_correctness()
-    
-    # Benchmark
-    benchmark_ddp_overlap()
+    # Check command line arguments for profiling mode
+    if "--profile-naive" in sys.argv:
+        profile_naive_ddp()
+    elif "--profile-overlap" in sys.argv:
+        profile_overlap_ddp()
+    elif "--profile-both" in sys.argv:
+        print("Profiling both implementations...")
+        print("\n1. Profiling Naive DDP:")
+        profile_naive_ddp()
+        print("\n2. Profiling Overlap DDP:")
+        profile_overlap_ddp()
+    else:
+        # Normal execution
+        print("DDP with Overlapping Communication and Computation")
+        print("=" * 80)
+        
+        # Test correctness
+        test_ddp_correctness()
+        
+        # Benchmark
+        benchmark_ddp_overlap()
