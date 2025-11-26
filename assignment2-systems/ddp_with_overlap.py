@@ -437,6 +437,10 @@ def _worker_benchmark_naive(rank: int, world_size: int, backend: str, results, n
     total_time = 0.0
     total_comm_time = 0.0
     
+    from torch.cuda import cudart
+
+    cudart().cudaProfilerStart()
+    
     for i in range(num_iters):
         iter_start = time.perf_counter()
         if NVTX_AVAILABLE and backend == "nccl":
@@ -486,6 +490,8 @@ def _worker_benchmark_naive(rank: int, world_size: int, backend: str, results, n
     
         if NVTX_AVAILABLE and backend == "nccl":
             nvtx.range_pop()  # Iteration
+            
+    cudart().cudaProfilerStop()
     
     if rank == 0:
         results['naive_time'] = total_time / num_iters * 1000  # ms
