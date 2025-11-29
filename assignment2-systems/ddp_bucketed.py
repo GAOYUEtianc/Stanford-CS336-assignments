@@ -463,7 +463,7 @@ def benchmark_bucket_sizes():
     backend = "nccl" if torch.cuda.is_available() else "gloo"
     print(f"Using backend: {backend}")
     
-    bucket_sizes = [1, 10, 25, 100, 1000]  # MB
+    bucket_sizes = [200, 400, 600]  # MB
     
     manager = mp.Manager()
     results = manager.dict()
@@ -521,7 +521,7 @@ def profile_bucketed_ddp(bucket_size_mb: float):
 
 def profile_all_bucket_sizes():
     """Profile all bucket sizes for comparison."""
-    bucket_sizes = [1, 10, 25, 100, 1000]
+    bucket_sizes = [200, 400, 600]
     
     print("=" * 80)
     print("Profiling All Bucket Sizes")
