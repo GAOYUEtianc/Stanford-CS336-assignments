@@ -10,7 +10,7 @@ from flashattention2 import (
 import torch
 from ddp_with_overlap import DDP
 from ddp_bucketed import DDPBucketed
-from sharded_optimizer import ShardedOptimizer
+from shard_optimizer import ShardedOptimizer
 
 
 
