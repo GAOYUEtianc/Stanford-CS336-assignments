@@ -600,3 +600,164 @@ Speedup (Flattened vs Naive):
   Communication Time: 1.63x faster
   Communication Overhead: Naive 38.9% vs Flattened 27.9%
 ```
+### Speedup the backward communication by overlapping
+This is the result running on A-100, 2 GPU, communicating with nccl, comparing naive computation \& communication with overlapping communication and computation for backward.
+
+Here's the statistics for overlappping : 
+| Instances	| Avg	| Med	| Min	| Max	| StdDev	| Range|
+|-----------|------|-----|----|-----|---------|------|
+|	40	|251.887 ms|	251.865 ms|	246.175 ms|	256.295 ms|	1.772 ms|	:Backward Pass (with async comm)
+
+Here's the statistics for naive ddp (where the backward computation and communication are separate process):
+|Instances	|Avg	|Med	|Min	|Max	|StdDev	| Range|
+|-----------|-----|-----|-----|-----|-------|------|
+|40	|260.293 ms|	269.900 ms	|242.838 ms	|273.005 ms	|12.846 ms	|:All-Reduce Gradients (sequential)|
+|40	|36.664 ms	|26.087 ms	|24.315 ms	|53.450 ms	|12.973 ms|	:Backward Pass (compute only)|
+
+Hence, overlapping will significantly reduce the total time of computation and communication time of backward process. 
+
+### Speedup the backward communication by bucketed ddp
+Here's the statistics for bucketed DDP with bucket size 10 MB:
+|Instances	|Avg	|Med	|Min	|Max	|StdDev	|Range|
+|-----------|-----|-----|-----|-----|-------|-----|
+|40	|72.745 ms|	71.929 ms|	67.519 ms|	100.382 ms|	5.523 ms|	:Backward Pass (buckets overlap)|
+46	|2.428 ms	|2.338 ms|	2.054 ms	|3.403 ms	|324.901 μs	|:Wait for All Buckets (388 handles)|
+46	|15.692 ms	|10.263 ms	|9.173 ms	|82.845 ms|	16.142 ms	|:Unflatten & Copy Back
+
+Here's the statistics for bucketed DDP with bucket size 200MB:
+|Instances	|Avg	|Med	|Min	|Max	|StdDev	|Range|
+|-----------|-----|-----|-----|-----|-------|-----|
+|40	|53.408 ms	|53.130 ms	|49.354 ms|	63.948 ms	|3.293 ms	|:Backward Pass (buckets overlap)|
+|46	|1.490 ms	|1.484 ms	|1.164 ms	|1.954 ms	|171.498 μs	|:Wait for All Buckets (193 handles)|
+|46	|24.234 ms|	20.227 ms	|9.803 ms	|146.695 ms	|21.138 ms	|:Unflatten & Copy Back|
+
+When bucket size > 400 MB, got OOM error. 
+
+Assume model total parameter size (bytes) is $s$; All-reduce bandwidth is $w$; Nccl communication launch time (seconds) is $o$; Number of buckets is $n_b$.
+Assume the time to compute gradient for a bucket equals to the communication time of this bucket. 
+
+Then a bucket size is : 
+$b = \frac{s}{n_b}$ (bytes)
+Communication time of a bucket is : 
+$T_{\text{commbucket}} = o + \frac{b}{w} = o + \frac{s}{n_b \cdot w}$
+Under assumption, computation time of a bucekt is : 
+$T_{\text{compbucket}}  = T_{\text{commbucket}} = o + \frac{s}{n_b \cdot w}$
+
+Ideally, the first $n_b - 1$ buckets' communication is totally overlapped in computation time, and only the last bucket's communication need to be waited. 
+But actually, the nccl launch time $o$ cannot be perfectly overlapped.
+
+Total backward time is the computation time of all buckets : 
+$T_{\text{backward}}=n_b\cdot T_{\text{compbucket}} = n_b\cdot (o+\frac{s}{n_b \cdot w}) = n_b\cdot o + \frac{s}{w}$.
+
+DDP overhead is composed of 2 parts : 
+1. Accumulated launch time (this cannot be perfectly overlapped)
+2. The last bucket's communication time (if remaining)
+
+Hence, $overhead \approx n_b \cdot o + max(0, \frac{s}{w} - T_{\text{compoverlap}})$
+For simplicity, if assuming the communication is perfectly overlapped by computation, 
+$overhead = n_b \cdot o$
+i.e., in order to reduce the overhead time, we should make the amount of buckets to be small, i.e., to make the size of each bucket as large as possible. 
+
+However, in a more sophisticated case (considering that overlapping is not perfect): 
+$overhead = n_b \cdot o + \frac{s}{n_b\cdot w}$
+where the first term is accumulated initialization overhead, the second item is the average communication time of per bucket.
+In order to get the most optimal $n_b$, we can do derivative on this formula 
+$\frac{\partial overhead}{\partial n_b} = o - \frac{s}{n_b^2\cdot w}$, and then get
+$n_b^* = \sqrt{\frac{s}{o\cdot w}}$,
+hence the optimal bucket size is :
+$b^* = \sqrt{s\cdot o \cdot w}$.
+
+In summary, the optimal bucket size increases with model size, all-reduce bandwidth, and initialization overhead: larger models, higher bandwidth, and longer initialization overheads all favor using larger buckets to reduce the number of launches.
+
+## 4D Parallelism
+### Single device memory 
+Each FFN block has 2 linear layers, 
+- Layer 1: $d_{model}\times d_{ff} = 16384\times 54328$
+- Layer 2: $d_{ff}\times d_{model} = 54328\times 16384$
+
+Hence every block has : 
+$\text{params per block} = d_{model}\times d_{ff} + d_{ff}\times d_{model}\\
+\qquad \qquad\qquad=2\times (16384\times 54328)\\
+\qquad \qquad\qquad= 1,744,830,464$ parameters
+And hence, 
+$\text{total parameters} = \text{number of blocks} \times \text{params per block}\\
+\qquad \qquad \qquad= 126 \times 1,744,830,464\\
+\qquad \qquad\qquad= 219,848,638,464\\
+\qquad \qquad\qquad \approx 220\text{ billion parameters}$
+
+Now let's compute the storage of FP32 : 
+- Master weights (FP32): $\text{weights fp32} = 220B \times 4 bytes = 880 GB$
+- Accumulated gradients (FP32): $\text{gradients fp32} = 220B \times 4 bytes = 880 GB$
+- Optimizer states (FP32, AdamW), note that AdamW needs to store 2 momentums: $\text{optimizer states} = 2\times 220B \times 4 bytes = 1,760 GB$
+
+Hence, total FP32 memory is : 
+$880+880+1,760 = 3,520 GB$
+
+Now let's compute how much we can save if we use BF16 for backward activations and communication
+- $\text{activations bf16} = 220B \times 2 bytes = 440GB$
+
+How many H100 (80GB) needed ? 
+3,520 GB / 80 GB = 44 GPUs
+
+### FSDP Sharding 
+1. Static per device : 3,520 GB / N_FSDP 
+2. Activations per block : $B\times L \times (d_\text{ff} + d_\text{model}) \times 2 = B\times L \times 139,264\; bytes$
+3. Total activations : $126 \times B\times L \times (d_\text{ff} + d_\text{model}) \times 2 = B\times L \times 139,264\; bytes\\
+\qquad \qquad \quad = 17.55\times B \times L \;(MB)$ 
+4. Only half of the activations are stored, and they're sharded, which is a commonly used activation checkpointing + FSDP, hence Activations per device = (Total activations / 2) / N_FSDP = 8.77 $\times$ B $\times$ L / N_FSDP (MB)
+5. Hence, 
+memory per device = Static / N_FSDP + Activation / N_FSDP
+= 3,520 GB / N_FSDP + (8.77 $\times$ B $\times$ L / N_FSDP (MB) )/ N_FSDP
+= (3,520 + 0.00877 $\times$ B $\times$ L) / N_FSDP (GB)
+6. Hence, in order to make memory per-device < 95GB, N_FSDP > (3,520 + 0.00877 × B × L) / 95. 
+For example, when B=1, L=2048 per device, we need >= 38 devices
+### Compute VS Communication Bound
+Given parameters : 
+- $W_{ici} = 2\times 9\times 10^{10}\;$ (bytes/s) **inter-chip interconnect bandwidth**
+- $C = 4.6\times 10^{14}$ FLOP/s 
+- Mesh: $X=16$ (FSDP), $Y=4$ (TP)
+- $M_X = 2, M_Y = 1$ (3D mesh)
+#### FSDP All-Gather (per layer)
+
+Now calculate the FSDP communication time (all-gather weights): 
+Every layer need all-gather weights : 
+$W_{\text{layer}}=2\times d_{\text{model}}\times d_{\text{ff}}\times 2\; bytes = 3.49\times 10^9\;bytes$
+
+As there're 4 TP devices, each TP device only needs 1/4 weights :
+$W_{\text{per TP}} = W_{\text{layer}}/4 = 8.73\times 10^8 \; bytes$
+
+Hence, FSDP all-gather communication (per TP device) needs to trans such amount of data : $W_{\text{per TP}}\times (X-1)/X$.
+
+Note that we have 126 blocks $\times$ 2 layers, hence 
+Total_FSDP_comm $= 8.18 × 10^8 × 252 = 2.06 × 10^{11} \;bytes$
+
+#### TP All-Reduce (per-layer)
+- After row-wise TP, the activation size per layer is : 
+A_layer = $B\times L \times d_{\text{model}}\times 2\;bytes$
+- The data size for TP all-reduce (Y=4) is : 
+DATA_TP = A_layer $\times (Y-1)/Y = B\times L \times d_{\text{model}}\times 2\times 3/4\;bytes = B × L × 24,576\; bytes $.
+- Note that only the second FFN layer need all-reduce, hence the total TP all-reduce data size is : 
+Total_TP_comm = $126 × B × L × 24,576 = 3.10 × 10^6 × B × L \;bytes$
+#### Total communication time
+T_comm = T_FSDP + T_TP
+       = Total_FSDP_comm / W_ici + Total_TP_comm / W_ici
+       = 2.06 × 10^11 / (2 × 9 × 10^10) + (3.10 × 10^6 × B × L) / (2 × 9 × 10^10)
+       = 1.14 + 1.72 × 10^-5 × B × L seconds
+
+#### Compute time 
+
+Compute time is FLOPs / C, so what is the total FLOPs? 
+Per block : $4\times B \times L\times d_{\text{model}}\times d_{\text{ff}}$
+Total : $4\times B \times L\times d_{\text{model}}\times d_{\text{ff}}\times \text{num blocks} = 4.40 × 10^{12} × B\times L$
+Hence total compute time is : 
+$4.40 × 10^{12} × B \times L/ 4.6\times 10^{14} = 9.57 × 10^{-3} × B \times L$ seconds
+
+#### Compute bound condition
+T_compute > T_comm indicates
+9.57 × 10^-3 × B × L > 1.14 + 1.72 × 10^-5 × B × L
+Hence 
+B × L > 119
+
+Usually our sequence length L is >> 119, hence, when B >= 1 (per device), it's compute-bound
+
+The overall batch size is  B × (X × Y) = 1 × 64 = 64
