@@ -184,28 +184,3 @@ class ShardedOptimizer(Optimizer):
         """
         if self.wrapped_optimizer is not None:
             self.wrapped_optimizer.load_state_dict(state_dict)
-
-
-def get_sharded_optimizer(
-    params: Iterable,
-    optimizer_cls: Type[torch.optim.Optimizer],
-    **kwargs
-) -> torch.optim.Optimizer:
-    """
-    Returns a torch.optim.Optimizer that handles optimizer state sharding
-    of the given optimizer_cls on the provided parameters.
-    
-    Arguments:
-        params (``Iterable``): an ``Iterable`` of :class:`torch.Tensor`s
-            or :class:`dict`s giving all parameters, which will be sharded
-            across ranks.
-        optimizer_cls (:class:`torch.optim.Optimizer`): the class of the local
-            optimizer.
-            
-    Keyword arguments:
-        kwargs: keyword arguments to be forwarded to the optimizer constructor.
-        
-    Returns:
-        Instance of sharded optimizer.
-    """
-    return ShardedOptimizer(params, optimizer_cls, **kwargs)

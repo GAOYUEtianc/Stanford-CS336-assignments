@@ -10,6 +10,7 @@ from flashattention2 import (
 import torch
 from ddp_with_overlap import DDP
 from ddp_bucketed import DDPBucketed
+from sharded_optimizer import ShardedOptimizer
 
 
 
@@ -148,4 +149,4 @@ def get_sharded_optimizer(params, optimizer_cls: Type[torch.optim.Optimizer], **
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    return ShardedOptimizer(params, optimizer_cls, **kwargs)
