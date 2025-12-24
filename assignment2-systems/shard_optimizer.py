@@ -31,14 +31,10 @@ class ShardedOptimizer(Optimizer):
         self.optimizer_cls = optimizer_cls
         self.optimizer_kwargs = kwargs
         
-        # Initialize empty parameter groups list
-        self.param_groups = []
-        
         # Get distributed training info
         if dist.is_initialized():
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
-            
         else:
             self.rank = 0
             self.world_size = 1
@@ -55,25 +51,21 @@ class ShardedOptimizer(Optimizer):
         # Mapping from parameter to owning rank
         self.param_to_rank: dict[torch.nn.Parameter, int] = {}
         
-        # Call parent constructor - this will call add_param_group for each group
         # Convert params to list of parameter groups if needed
         if isinstance(params, torch.Tensor):
             params = [params]
             
         param_groups_list = list(params)
+        
         if len(param_groups_list) == 0:
             raise ValueError("optimizer got an empty parameter list")
         
         if not isinstance(param_groups_list[0], dict):
             param_groups_list = [{'params': param_groups_list}]
         
-        # Now we need to call the Optimizer.__init__ but with empty params first
-        # Then add the actual params via add_param_group
-        super().__init__([], {})
-        
-        # Add each parameter group
-        for param_group in param_groups_list:
-            self.add_param_group(param_group)
+        # Initialize the parent with the parameter groups
+        # The parent class will call add_param_group for each group
+        super().__init__(param_groups_list, {})
     
     
     def add_param_group(self, param_group: dict[str, Any]) -> None:
@@ -94,6 +86,14 @@ class ShardedOptimizer(Optimizer):
         else:
             params = list(params)
             
+        # Ensure all_params list exists (might not during parent init)
+        if not hasattr(self, 'all_params'):
+            self.all_params = []
+        if not hasattr(self, 'owned_params'):
+            self.owned_params = []
+        if not hasattr(self, 'param_to_rank'):
+            self.param_to_rank = {}
+            
         # Store all parameters for broadcasting
         new_all_params = [p for p in params if p not in self.all_params]
         self.all_params.extend(new_all_params)
@@ -101,14 +101,21 @@ class ShardedOptimizer(Optimizer):
         # Assign parameters to ranks using round-robin strategy
         # We need to shard the new parameters
         new_owned_params = []
-        for idx, param in enumerate(new_all_params):
+        for i, param in enumerate(new_all_params):
             # Determine which rank owns this parameter based on global index
-            global_idx = len(self.all_params) - len(new_all_params) + idx
+            global_idx = len(self.all_params) - len(new_all_params) + i
             owning_rank = global_idx % self.world_size
+            self.param_to_rank[param] = owning_rank
             
             if owning_rank == self.rank:
                 new_owned_params.append(param)
                 self.owned_params.append(param)
+                
+        # Add the full parameter group to self.param_groups (parent class uses this)
+        # Make a copy to avoid modifying the original
+        full_param_group = param_group.copy()
+        full_param_group['params'] = params
+        super().add_param_group(full_param_group)
         
         # Create parameter group for wrapped optimizer (only with owned params)
         if new_owned_params:
@@ -124,11 +131,8 @@ class ShardedOptimizer(Optimizer):
             else:
                 # Add to existing wrapped optimizer
                 self.wrapped_optimizer.add_param_group(wrapped_param_group)
-        
-        # Add to our param_groups list (with all params, not just owned)
-        self.param_groups.append(param_group)
-        
-        
+    
+    
     def step(self, closure=None, **kwargs) -> Optional[float]:
         """
         Perform an optimization step.
@@ -163,7 +167,8 @@ class ShardedOptimizer(Optimizer):
             owning_rank = self.param_to_rank[param]
             # Broadcast from the owning rank to all others
             dist.broadcast(param.data, src=owning_rank)
-            
+    
+    
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Zero out gradients. Delegates to wrapped optimizer if it exists."""
         if self.wrapped_optimizer is not None:
@@ -178,9 +183,11 @@ class ShardedOptimizer(Optimizer):
             return self.wrapped_optimizer.state_dict()
         return {'state': {}, 'param_groups': []}
     
+    
     def load_state_dict(self, state_dict: dict) -> None:
         """
         Load state dict. Only loads state for owned parameters.
         """
         if self.wrapped_optimizer is not None:
             self.wrapped_optimizer.load_state_dict(state_dict)
+
